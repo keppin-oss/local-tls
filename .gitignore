@@ -1,0 +1,10 @@
+# Build artifacts
+*.exe
+*.test
+*.out
+
+# Manual verification tool binaries
+/verify
+verify.exe
+/verify-cng
+verify-cng.exe
