@@ -61,7 +61,7 @@ func ProvisionMachine() (Material, error) {
 		)
 	}
 
-	return ProvisionWithKeyStore(root, keyStore, trustStore, time.Now)
+	return provisionWithKeyStore(root, keyStore, trustStore, time.Now, true)
 }
 
 // ReloadMachine loads existing production machine TLS material for normal runtime.
@@ -173,6 +173,11 @@ func ReloadMachine() (Material, error) {
 		needsRenewal = true
 	}
 	if needsRenewal {
+		if err := validateCALifetime(caCert, nowTime); err != nil {
+			closeProductionSigner(caSigner)
+			closeProductionSigner(serverSigner)
+			return Material{}, err
+		}
 		newServerCert, err := generateServerCertWithSigner(nowTime, caCert, caSigner, serverSigner)
 		if err != nil {
 			closeProductionSigner(caSigner)

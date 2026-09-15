@@ -129,7 +129,7 @@ func createServerCertWithPub(now time.Time, caCert *x509.Certificate, caSigner c
 			Organization: []string{serverOrg},
 		},
 		NotBefore:   now.Add(-5 * time.Minute),
-		NotAfter:    now.Add(serverValidity),
+		NotAfter:    cappedServerNotAfter(now, caCert),
 		DNSNames:    []string{"localhost"},
 		IPAddresses: []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback},
 		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
@@ -157,6 +157,31 @@ func randomSerial() (*big.Int, error) {
 		return randomSerial()
 	}
 	return serial, nil
+}
+
+// cappedServerNotAfter returns the NotAfter for a server certificate issued at
+// now by caCert. It caps the nominal server validity (now + serverValidity) at
+// the CA's own NotAfter so a leaf never outlives the CA that signs it.
+func cappedServerNotAfter(now time.Time, caCert *x509.Certificate) time.Time {
+	notAfter := now.Add(serverValidity)
+	if notAfter.After(caCert.NotAfter) {
+		return caCert.NotAfter
+	}
+	return notAfter
+}
+
+// validateCALifetime returns an error when the CA certificate is not currently
+// valid (not yet valid or already expired). A CA in either state cannot safely
+// issue a new leaf; CA recovery/reprovisioning is required, and the CA identity
+// must never be silently replaced.
+func validateCALifetime(caCert *x509.Certificate, now time.Time) error {
+	if now.Before(caCert.NotBefore) {
+		return fmt.Errorf("CA certificate is not yet valid (NotBefore %s): CA recovery/reprovisioning required", caCert.NotBefore.UTC())
+	}
+	if !now.Before(caCert.NotAfter) {
+		return fmt.Errorf("CA certificate has expired (NotAfter %s): CA recovery/reprovisioning required", caCert.NotAfter.UTC())
+	}
+	return nil
 }
 
 func verifyPublicKeyMatch(cert *x509.Certificate, pub crypto.PublicKey) error {
