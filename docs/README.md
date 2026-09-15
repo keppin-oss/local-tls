@@ -92,7 +92,7 @@ trust-store framework.
 ### Dependencies
 
 ```
-github.com/keppin-oss/cng v0.1.1      // windowscng — CNG/KSP key custody
+github.com/keppin-oss/cng v0.1.2      // windowscng — CNG/KSP key custody
 golang.org/x/sys        v0.47.0       // Windows syscall bindings
 ```
 

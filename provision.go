@@ -91,6 +91,16 @@ func provisionStateInconsistent(caDER, serverDER, caKey, serverKey bool) bool {
 // persistent signing keys. Only public certificate DERs are written to disk;
 // private keys remain in the machine-scoped key store.
 func ProvisionWithKeyStore(dataDir string, keyStore MachineKeyStore, trustStore TrustStore, now func() time.Time) (Material, error) {
+	return provisionWithKeyStore(dataDir, keyStore, trustStore, now, false)
+}
+
+// provisionWithKeyStore is the internal provisioning seam. repairTrust enables
+// the elevated repair path: when a complete, internally valid persisted state
+// has a missing (but otherwise exact) trust anchor, the same persisted CA is
+// reinstalled rather than rejected. It must only be enabled for the elevated
+// provisioning/repair operation; serving and reload-only paths remain read-only
+// with respect to trust.
+func provisionWithKeyStore(dataDir string, keyStore MachineKeyStore, trustStore TrustStore, now func() time.Time, repairTrust bool) (Material, error) {
 	if now == nil {
 		now = time.Now
 	}
@@ -98,7 +108,7 @@ func ProvisionWithKeyStore(dataDir string, keyStore MachineKeyStore, trustStore 
 	if !fileExists(filepath.Join(tlsDir, caCertFile)) || !fileExists(filepath.Join(tlsDir, serverCertFile)) {
 		return firstProvisionWithKeyStore(tlsDir, keyStore, trustStore, now)
 	}
-	return reloadWithKeyStore(tlsDir, keyStore, trustStore, now)
+	return reloadWithKeyStore(tlsDir, keyStore, trustStore, now, repairTrust)
 }
 
 func firstProvisionWithKeyStore(tlsDir string, keyStore MachineKeyStore, trustStore TrustStore, now func() time.Time) (Material, error) {
@@ -155,7 +165,7 @@ func firstProvisionWithKeyStore(tlsDir string, keyStore MachineKeyStore, trustSt
 	return materialFromSigners(caCert, serverCert, serverSigner), nil
 }
 
-func reloadWithKeyStore(tlsDir string, keyStore MachineKeyStore, trustStore TrustStore, now func() time.Time) (Material, error) {
+func reloadWithKeyStore(tlsDir string, keyStore MachineKeyStore, trustStore TrustStore, now func() time.Time, repairTrust bool) (Material, error) {
 	caCert, caSigner, err := loadCASigner(tlsDir, keyStore)
 	if err != nil {
 		return Material{}, fmt.Errorf("load CA: %w", err)
@@ -188,18 +198,43 @@ func reloadWithKeyStore(tlsDir string, keyStore MachineKeyStore, trustStore Trus
 	if trustErr != nil {
 		return Material{}, fmt.Errorf("verify CA trust: %w", trustErr)
 	}
-	if state != TrustHealthy {
+	switch state {
+	case TrustHealthy:
+		// Trust is present and exact: proceed.
+	case TrustAbsent:
+		if !repairTrust {
+			return Material{}, fmt.Errorf("CA not trusted: trust state is %s (elevated provisioning/repair required)", state)
+		}
+		// Elevated repair: reinstall the exact persisted CA. This never
+		// generates a new CA identity or replaces the persisted CA.
+		if err := trustStore.InstallTrust(caCert.Raw); err != nil {
+			return Material{}, fmt.Errorf("reinstall CA trust anchor: %w", err)
+		}
+		reinstalled, err := trustStore.VerifyTrust(caCert.Raw)
+		if err != nil {
+			return Material{}, fmt.Errorf("verify CA trust after reinstall: %w", err)
+		}
+		if reinstalled != TrustHealthy {
+			return Material{}, fmt.Errorf("CA trust reinstall did not restore trust: trust state is %s", reinstalled)
+		}
+	default:
+		// A conflicting or otherwise mismatching trust state is an explicit,
+		// manual recovery condition and must never be overwritten.
 		return Material{}, fmt.Errorf("CA not trusted: trust state is %s (elevated provisioning/repair required)", state)
 	}
 
 	needsRenewal := false
-	if nowTime := now(); nowTime.After(serverCert.NotAfter) || serverCert.NotAfter.Sub(nowTime) <= RenewalThreshold {
+	nowTime := now()
+	if nowTime.After(serverCert.NotAfter) || serverCert.NotAfter.Sub(nowTime) <= RenewalThreshold {
 		needsRenewal = true
 	}
 	if needsRenewal {
+		if err := validateCALifetime(caCert, nowTime); err != nil {
+			return Material{}, err
+		}
 		// Reuse existing server signer so key rotation is decoupled from
 		// certificate renewal. CNG persisted key is NOT overwritten.
-		newServerCert, err := generateServerCertWithSigner(now(), caCert, caSigner, serverSigner)
+		newServerCert, err := generateServerCertWithSigner(nowTime, caCert, caSigner, serverSigner)
 		if err != nil {
 			return Material{}, fmt.Errorf("renew server certificate: %w", err)
 		}
@@ -363,11 +398,15 @@ func reload(tlsDir string, protector Protector, trustStore TrustStore, now func(
 		return Material{}, fmt.Errorf("CA not trusted: trust state is %s (elevated provisioning/repair required)", state)
 	}
 	needsRenewal := false
-	if nowTime := now(); nowTime.After(serverCert.NotAfter) || serverCert.NotAfter.Sub(nowTime) <= RenewalThreshold {
+	nowTime := now()
+	if nowTime.After(serverCert.NotAfter) || serverCert.NotAfter.Sub(nowTime) <= RenewalThreshold {
 		needsRenewal = true
 	}
 	if needsRenewal {
-		newServerCert, newServerKey, err := generateServerCert(now(), caCert, caKey)
+		if err := validateCALifetime(caCert, nowTime); err != nil {
+			return Material{}, err
+		}
+		newServerCert, newServerKey, err := generateServerCert(nowTime, caCert, caKey)
 		if err != nil {
 			return Material{}, fmt.Errorf("renew server certificate: %w", err)
 		}

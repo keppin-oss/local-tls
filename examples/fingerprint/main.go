@@ -28,7 +28,7 @@ func main() {
 	// A real workflow obtains this from Material.CAFingerprintSHA256 (via
 	// ProvisionMachine/LoadServingMaterial) or from a stored diagnostic value.
 	// ParseSHA256Fingerprint tolerates surrounding whitespace and case.
-	hexFP := "  a1b2c3d4e5f60718293a4b5c6d7e8f90112233445566778899a0b1c2d3e4f5  "
+	hexFP := "  0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  "
 	fp, err := localtls.ParseSHA256Fingerprint(hexFP)
 	if err != nil {
 		log.Fatalf("ParseSHA256Fingerprint failed: %v", err)
