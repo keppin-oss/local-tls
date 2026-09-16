@@ -87,7 +87,7 @@ trust-store framework.
   elevation, but the calling process must be able to open the persisted server key
   (caller responsibility).
 - **Microsoft Software Key Storage Provider** is the only supported key store.
-- **Go** — the module declares `go 1.26.5`.
+- **Go** — the module declares `go 1.26.8`.
 
 ### Dependencies
 
