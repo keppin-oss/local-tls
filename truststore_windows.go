@@ -113,9 +113,10 @@ func (s *windowsTrustStore) InstallTrust(certificateDER []byte) error {
 	return nil
 }
 
-// deleteCertificateFromStore deletes cert from the store and returns the result.
-// CertDeleteCertificateFromStore takes ownership of cert and frees it (it calls
-// CertFreeCertificateContext internally), so the caller must not free cert again.
+// deleteCertificateFromStore deletes cert from its store and returns the
+// result. CertDeleteCertificateFromStore always frees cert (it calls
+// CertFreeCertificateContext internally, even when it fails), so ownership of
+// cert passes to this call and the caller must not free or use it afterward.
 func deleteCertificateFromStore(cert *windows.CertContext) error {
 	return windows.CertDeleteCertificateFromStore(cert)
 }
@@ -141,6 +142,7 @@ func (s *windowsTrustStore) RemoveTrust(certificateDER []byte) error {
 		return fmt.Errorf("%w", ErrTrustAnchorNotFound)
 	}
 
+	// existing is owned and freed by the delete; it is not freed again here.
 	if err := deleteCertificateFromStore(existing); err != nil {
 		return fmt.Errorf("CertDeleteCertificateFromStore: %w", err)
 	}
@@ -168,6 +170,7 @@ func (s *windowsTrustStore) RemoveTrustBySHA256(fp [32]byte) error {
 		return fmt.Errorf("certificate with fingerprint %x not found in LocalMachine\\Root: %w", fp, ErrTrustAnchorNotFound)
 	}
 
+	// existing is owned and freed by the delete; it is not freed again here.
 	if err := deleteCertificateFromStore(existing); err != nil {
 		return fmt.Errorf("CertDeleteCertificateFromStore: %w", err)
 	}

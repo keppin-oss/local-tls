@@ -1,6 +1,7 @@
 package localtls
 
 import (
+	"bytes"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -8,7 +9,9 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"os"
 	"path/filepath"
@@ -40,9 +43,9 @@ type fakeTrustStore struct {
 	is       func([32]byte) (bool, error)
 }
 
-func (fts *fakeTrustStore) EnsureTrusted(der []byte) error             { return fts.install(der) }
-func (fts *fakeTrustStore) InstallTrust(der []byte) error              { return fts.install(der) }
-func (fts *fakeTrustStore) RemoveTrust(der []byte) error               { return fts.remove(der) }
+func (fts *fakeTrustStore) EnsureTrusted(der []byte) error { return fts.install(der) }
+func (fts *fakeTrustStore) InstallTrust(der []byte) error  { return fts.install(der) }
+func (fts *fakeTrustStore) RemoveTrust(der []byte) error   { return fts.remove(der) }
 func (fts *fakeTrustStore) RemoveTrustBySHA256(fp [32]byte) error {
 	if fts.removeFP != nil {
 		return fts.removeFP(fp)
@@ -426,93 +429,165 @@ func (f fakeMachineKeyStore) LoadOrCreateServerKey() (crypto.Signer, error) {
 	return key, nil
 }
 
-// TestProvisionExistingKeyMissingCertMustNotRegenerateCA verifies the
-// production requirement that when a persisted CA key exists but the CA
-// certificate DER is missing, firstProvisionWithKeyStore will regenerate
-// a new CA certificate with a different fingerprint. This test documents
-// the behavior that the composition-layer guard (checkInconsistentMachineState)
-// is designed to prevent.
-func TestProvisionExistingKeyMissingCertRegeneratesCA(t *testing.T) {
-	dir := t.TempDir()
-	dataDir := filepath.Join(dir, "data")
-	now := time.Date(2026, 8, 8, 0, 0, 0, 0, time.UTC)
-
-	// 1. First provision with a key store that has existing keys.
-	ks1 := newFakeMachineKeyStore(true, true)
-	m1, err := ProvisionWithKeyStore(dataDir, ks1, okTrustStore(), fixedNow(now))
-	if err != nil {
-		t.Fatalf("first provision: %v", err)
-	}
-	fp1 := m1.CAFingerprintSHA256
-
-	// 2. Remove ca-cert.der to simulate missing/corrupt public material.
-	os.Remove(filepath.Join(dataDir, tlsSubDir, caCertFile))
-
-	// 3. Re-provision with the same key store (same keys).
-	ks2 := newFakeMachineKeyStore(true, true)
-	ks2.caSigner = ks1.caSigner
-	ks2.serverSigner = ks1.serverSigner
-
-	m2, err := ProvisionWithKeyStore(dataDir, ks2, okTrustStore(), fixedNow(now))
-	if err != nil {
-		t.Fatalf("re-provision after cert removal: %v", err)
-	}
-	fp2 := m2.CAFingerprintSHA256
-
-	// 4. The CA fingerprint MUST differ — this proves that without the
-	//    composition-layer guard, ProvisionWithKeyStore silently regenerates
-	//    a new CA certificate against an existing key.
-	if fp1 == fp2 {
-		t.Fatal("CA fingerprint did NOT change after cert removal; this is unexpected — the test expects regeneration")
-	}
-
-	t.Logf("CA fingerprint changed: %x → %x (expected — without guard, new cert is generated against existing key)", fp1, fp2)
-	t.Log("This test documents the behavior that the composition-layer guard prevents in production.")
+// countingKeyStore records MachineKeyStore calls so tests can prove a path
+// never acquires (and therefore never creates) a key.
+type countingKeyStore struct {
+	inner            MachineKeyStore
+	caCalls, srCalls int
 }
 
-// TestRenewalViaKeyStorePreservesCAAndServerKey proves the renewal logic remains
-// functional at the keystore seam: renewing a near-expiry server certificate
-// through ProvisionWithKeyStore preserves the CA identity and reuses the
-// existing server key (key rotation is decoupled from certificate renewal).
-func TestRenewalViaKeyStorePreservesCAAndServerKey(t *testing.T) {
-	dir := t.TempDir()
-	dataDir := filepath.Join(dir, "data")
-	now := time.Date(2026, 8, 8, 0, 0, 0, 0, time.UTC)
+func (c *countingKeyStore) LoadOrCreateCAKey() (crypto.Signer, error) {
+	c.caCalls++
+	return c.inner.LoadOrCreateCAKey()
+}
 
-	ks1 := newFakeMachineKeyStore(true, true)
-	m1, err := ProvisionWithKeyStore(dataDir, ks1, okTrustStore(), fixedNow(now))
+func (c *countingKeyStore) LoadOrCreateServerKey() (crypto.Signer, error) {
+	c.srCalls++
+	return c.inner.LoadOrCreateServerKey()
+}
+
+// countingTrustStore counts InstallTrust calls on top of okTrustStore.
+func countingTrustStore(installs *int) *fakeTrustStore {
+	ts := okTrustStore()
+	ts.install = func([]byte) error { *installs++; return nil }
+	return ts
+}
+
+// TestProvisionPartialStateFailsClosed proves that when exactly one of the two
+// certificate DERs exists, ProvisionWithKeyStore fails closed without acquiring
+// a key, reissuing the CA certificate or installing trust.
+func TestProvisionPartialStateFailsClosed(t *testing.T) {
+	for _, missing := range []string{caCertFile, serverCertFile} {
+		t.Run("missing "+missing, func(t *testing.T) {
+			dataDir := filepath.Join(t.TempDir(), "data")
+			now := time.Date(2026, 8, 8, 0, 0, 0, 0, time.UTC)
+			ks := newFakeMachineKeyStore(true, true)
+			if _, err := ProvisionWithKeyStore(dataDir, ks, okTrustStore(), fixedNow(now)); err != nil {
+				t.Fatalf("first provision: %v", err)
+			}
+			tlsDir := filepath.Join(dataDir, tlsSubDir)
+			kept := caCertFile
+			if missing == caCertFile {
+				kept = serverCertFile
+			}
+			keptBytes, _ := os.ReadFile(filepath.Join(tlsDir, kept))
+			os.Remove(filepath.Join(tlsDir, missing))
+
+			counting := &countingKeyStore{inner: ks}
+			installs := 0
+			_, err := ProvisionWithKeyStore(dataDir, counting, countingTrustStore(&installs), fixedNow(now))
+			if !errors.Is(err, ErrInconsistentMachineState) {
+				t.Fatalf("err = %v, want ErrInconsistentMachineState", err)
+			}
+			if counting.caCalls+counting.srCalls != 0 || installs != 0 {
+				t.Fatalf("partial state acquired keys (%d/%d) or installed trust (%d)", counting.caCalls, counting.srCalls, installs)
+			}
+			after, _ := os.ReadFile(filepath.Join(tlsDir, kept))
+			if !bytes.Equal(after, keptBytes) || fileExists(filepath.Join(tlsDir, missing)) {
+				t.Fatal("partial state must be left exactly as found")
+			}
+		})
+	}
+}
+
+// TestProvisionStatAccessErrorFailsClosed proves that a certificate DER whose
+// presence cannot be determined is not treated as absent by either the
+// pre-check or ProvisionWithKeyStore.
+func TestProvisionStatAccessErrorFailsClosed(t *testing.T) {
+	saved := osFS
+	t.Cleanup(func() { osFS = saved })
+	osFS.stat = func(string) (fs.FileInfo, error) { return nil, fs.ErrPermission }
+
+	dataDir := filepath.Join(t.TempDir(), "data")
+	counting := &countingKeyStore{inner: newFakeMachineKeyStore(false, false)}
+	installs := 0
+	_, err := ProvisionWithKeyStore(dataDir, counting, countingTrustStore(&installs), fixedNow(time.Now()))
+	if !errors.Is(err, ErrInconsistentMachineState) || !strings.Contains(err.Error(), "permission") {
+		t.Fatalf("err = %v, want ErrInconsistentMachineState carrying the access error", err)
+	}
+	if counting.caCalls+counting.srCalls != 0 || installs != 0 {
+		t.Fatal("an undeterminable DER must not start a first install")
+	}
+
+	probe := &precheckProbe{}
+	isPriv, _ := privileged(true, nil)
+	if err := provisionPreCheck(filepath.Join(dataDir, tlsSubDir), precheckCAKey, probe.probe, isPriv); !errors.Is(err, ErrInconsistentMachineState) {
+		t.Fatalf("pre-check err = %v, want ErrInconsistentMachineState", err)
+	}
+	if probe.calls != 0 {
+		t.Fatal("pre-check must fail before probing keys")
+	}
+}
+
+// TestProvisionWithKeyStoreExistingStateNeverRenews proves the existing-state provisioning
+// policy: a still-valid leaf inside the renewal window is returned as verified
+// Material with a nil error, an expired leaf fails with ErrRenewalDue and
+// ErrCertificateNotValidNow, and neither case writes certificates, stages a
+// candidate or installs trust.
+func TestProvisionWithKeyStoreExistingStateNeverRenews(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "data")
+	now := time.Date(2026, 8, 8, 0, 0, 0, 0, time.UTC)
+	ks := &closeTrackingKeyStore{caSigner: newFakeCloseSigner(), serverSigner: newFakeCloseSigner()}
+	first, err := ProvisionWithKeyStore(dataDir, ks, okTrustStore(), fixedNow(now))
 	if err != nil {
 		t.Fatalf("first provision: %v", err)
 	}
-	fp1 := m1.CAFingerprintSHA256
-	serverPub1, ok := m1.Certificate.PrivateKey.(crypto.Signer).Public().(*ecdsa.PublicKey)
-	if !ok {
-		t.Fatalf("server signer public key is %T, want *ecdsa.PublicKey", m1.Certificate.PrivateKey.(crypto.Signer).Public())
+	tlsDir := filepath.Join(dataDir, tlsSubDir)
+	before, _ := os.ReadFile(filepath.Join(tlsDir, serverCertFile))
+	assertUnchanged := func(t *testing.T, installs int) {
+		t.Helper()
+		after, _ := os.ReadFile(filepath.Join(tlsDir, serverCertFile))
+		if !bytes.Equal(after, before) || fileExists(filepath.Join(tlsDir, pendingServerCertFile)) || installs != 0 {
+			t.Fatal("existing-state provisioning must not write certificates, stage a candidate or install trust")
+		}
+	}
+	reset := func() {
+		ks.caSigner.closed, ks.serverSigner.closed = false, false
 	}
 
-	// Advance near server expiry to force renewal through the keystore seam.
-	nearExpiry := now.Add(61 * 24 * time.Hour)
-	ks2 := newFakeMachineKeyStore(true, true)
-	ks2.caSigner = ks1.caSigner
-	ks2.serverSigner = ks1.serverSigner
-
-	m2, err := ProvisionWithKeyStore(dataDir, ks2, okTrustStore(), fixedNow(nearExpiry))
-	if err != nil {
-		t.Fatalf("renew provision: %v", err)
-	}
-	if m2.CAFingerprintSHA256 != fp1 {
-		t.Fatal("CA fingerprint changed across renewal")
-	}
-	if m2.ServerCertificate.Equal(m1.ServerCertificate) {
-		t.Fatal("server certificate was not renewed")
-	}
-	serverPub2, ok := m2.Certificate.PrivateKey.(crypto.Signer).Public().(*ecdsa.PublicKey)
-	if !ok {
-		t.Fatalf("renewed server signer public key is %T, want *ecdsa.PublicKey", m2.Certificate.PrivateKey.(crypto.Signer).Public())
-	}
-	if serverPub2.X.Cmp(serverPub1.X) != 0 || serverPub2.Y.Cmp(serverPub1.Y) != 0 {
-		t.Fatal("server key was rotated during certificate renewal; expected reuse of the persisted key")
-	}
+	t.Run("valid within renewal window", func(t *testing.T) {
+		reset()
+		installs := 0
+		m, err := ProvisionWithKeyStore(dataDir, ks, countingTrustStore(&installs), fixedNow(now.Add(61*24*time.Hour)))
+		if err != nil {
+			t.Fatalf("err = %v, want nil (verified, not renewed)", err)
+		}
+		if !m.ServerCertificate.Equal(first.ServerCertificate) {
+			t.Fatal("provisioning must return the existing, unrenewed certificate")
+		}
+		if !ks.caSigner.closed || ks.serverSigner.closed {
+			t.Fatal("CA signer must be released and the server signer transferred to the caller")
+		}
+		assertUnchanged(t, installs)
+	})
+	t.Run("expired", func(t *testing.T) {
+		reset()
+		installs := 0
+		m, err := ProvisionWithKeyStore(dataDir, ks, countingTrustStore(&installs), fixedNow(now.Add(91*24*time.Hour)))
+		if !errors.Is(err, ErrRenewalDue) || !errors.Is(err, ErrCertificateNotValidNow) {
+			t.Fatalf("err = %v, want ErrRenewalDue and ErrCertificateNotValidNow", err)
+		}
+		if m.ServerCertificate != nil || m.Certificate.PrivateKey != nil {
+			t.Fatal("a failure must return a zero Material")
+		}
+		if !ks.caSigner.closed || !ks.serverSigner.closed {
+			t.Fatal("both signers must be released on failure")
+		}
+		assertUnchanged(t, installs)
+	})
+	t.Run("trust not healthy", func(t *testing.T) {
+		reset()
+		installs := 0
+		ts := countingTrustStore(&installs)
+		ts.verify = func([]byte) (TrustState, error) { return TrustAbsent, nil }
+		if _, err := ProvisionWithKeyStore(dataDir, ks, ts, fixedNow(now.Add(61*24*time.Hour))); !errors.Is(err, ErrTrustNotHealthy) {
+			t.Fatalf("err = %v, want ErrTrustNotHealthy", err)
+		}
+		if !ks.caSigner.closed || !ks.serverSigner.closed {
+			t.Fatal("both signers must be released on failure")
+		}
+		assertUnchanged(t, installs)
+	})
 }
 
 // TestProvisionStateClassification proves the production state matrix: only a
@@ -592,99 +667,10 @@ func TestReloadRejectsCorruptCADER(t *testing.T) {
 	}
 }
 
-// ---- LTL-001: trust repair belongs only in the elevated provisioning path ----
+// ---- LTL-001: existing-state provisioning never installs trust ----
 
-// TestElevatedProvisionRepairsMissingTrust proves the elevated provisioning
-// repair path reinstalls the exact persisted CA when the persisted material is
-// complete but the trust anchor is absent, without changing the CA identity.
-func TestElevatedProvisionRepairsMissingTrust(t *testing.T) {
-	dir := t.TempDir()
-	dataDir := filepath.Join(dir, "data")
-	now := time.Date(2026, 8, 8, 0, 0, 0, 0, time.UTC)
-
-	var installCount int
-	var installedDER []byte
-	trustPresent := true
-	store := &fakeTrustStore{
-		install: func(der []byte) error {
-			installCount++
-			installedDER = append([]byte{}, der...)
-			trustPresent = true
-			return nil
-		},
-		remove: func([]byte) error { return nil },
-		verify: func([]byte) (TrustState, error) {
-			if trustPresent {
-				return TrustHealthy, nil
-			}
-			return TrustAbsent, nil
-		},
-		is: func([32]byte) (bool, error) { return false, nil },
-	}
-
-	ks1 := newFakeMachineKeyStore(true, true)
-	m1, err := ProvisionWithKeyStore(dataDir, ks1, store, fixedNow(now))
-	if err != nil {
-		t.Fatalf("first provision: %v", err)
-	}
-	fp1 := m1.CAFingerprintSHA256
-	firstInstallCount := installCount
-
-	// Simulate the trust anchor being removed from the machine store.
-	trustPresent = false
-
-	ks2 := newFakeMachineKeyStore(true, true)
-	ks2.caSigner = ks1.caSigner
-	ks2.serverSigner = ks1.serverSigner
-	m2, err := provisionWithKeyStore(dataDir, ks2, store, fixedNow(now), true)
-	if err != nil {
-		t.Fatalf("elevated repair: %v", err)
-	}
-	if m2.CAFingerprintSHA256 != fp1 {
-		t.Fatal("CA fingerprint changed during repair; must preserve the existing CA identity")
-	}
-	if installCount != firstInstallCount+1 {
-		t.Fatalf("expected exactly one reinstall, got %d total installs", installCount)
-	}
-	if sha256.Sum256(installedDER) != fp1 {
-		t.Fatal("reinstalled CA DER does not match the existing CA")
-	}
-}
-
-// TestElevatedProvisionConflictingTrustStillRejected proves a conflicting trust
-// state is an explicit/manual recovery condition even on the elevated repair
-// path and is never overwritten.
-func TestElevatedProvisionConflictingTrustStillRejected(t *testing.T) {
-	dir := t.TempDir()
-	dataDir := filepath.Join(dir, "data")
-	now := time.Date(2026, 8, 8, 0, 0, 0, 0, time.UTC)
-
-	installCount := 0
-	store := &fakeTrustStore{
-		install: func([]byte) error { installCount++; return nil },
-		remove:  func([]byte) error { return nil },
-		verify:  func([]byte) (TrustState, error) { return TrustConflict, nil },
-		is:      func([32]byte) (bool, error) { return false, nil },
-	}
-
-	ks1 := newFakeMachineKeyStore(true, true)
-	if _, err := ProvisionWithKeyStore(dataDir, ks1, store, fixedNow(now)); err != nil {
-		t.Fatalf("first provision: %v", err)
-	}
-
-	ks2 := newFakeMachineKeyStore(true, true)
-	ks2.caSigner = ks1.caSigner
-	ks2.serverSigner = ks1.serverSigner
-	if _, err := provisionWithKeyStore(dataDir, ks2, store, fixedNow(now), true); err == nil {
-		t.Fatal("expected conflicting trust to be rejected on the elevated repair path")
-	}
-	if installCount != 1 {
-		t.Fatalf("conflicting trust must not be overwritten; installs = %d, want 1", installCount)
-	}
-}
-
-// TestReloadWithoutRepairDoesNotInstallTrust proves the ordinary reload path
-// (repairTrust disabled) fails closed on a missing trust anchor and never
+// TestReloadWithoutRepairDoesNotInstallTrust proves that existing-state
+// provisioning fails closed on a missing trust anchor and never
 // installs trust.
 func TestReloadWithoutRepairDoesNotInstallTrust(t *testing.T) {
 	dir := t.TempDir()
@@ -716,33 +702,12 @@ func TestReloadWithoutRepairDoesNotInstallTrust(t *testing.T) {
 	}
 }
 
-// ---- LTL-002: reject renewal under an invalid CA lifetime ----
+// ---- LTL-002: reject existing state under an invalid CA lifetime ----
 
-// TestValidateCALifetime proves the CA lifetime validator rejects an expired CA
-// and a not-yet-valid CA, and accepts a currently-valid CA.
-func TestValidateCALifetime(t *testing.T) {
-	now := time.Date(2026, 8, 8, 0, 0, 0, 0, time.UTC)
-
-	expired := &x509.Certificate{NotBefore: now.Add(-10 * time.Hour), NotAfter: now.Add(-time.Hour)}
-	if err := validateCALifetime(expired, now); err == nil || !strings.Contains(err.Error(), "expired") {
-		t.Fatalf("expired CA: err = %v, want expired error", err)
-	}
-
-	notYetValid := &x509.Certificate{NotBefore: now.Add(time.Hour), NotAfter: now.Add(2 * time.Hour)}
-	if err := validateCALifetime(notYetValid, now); err == nil || !strings.Contains(err.Error(), "not yet valid") {
-		t.Fatalf("not-yet-valid CA: err = %v, want not-yet-valid error", err)
-	}
-
-	valid := &x509.Certificate{NotBefore: now.Add(-time.Hour), NotAfter: now.Add(time.Hour)}
-	if err := validateCALifetime(valid, now); err != nil {
-		t.Fatalf("valid CA: %v", err)
-	}
-}
-
-// TestRenewalRejectsExpiredCA proves the renewal path rejects a CA that has
-// expired rather than issuing a leaf that clients would reject during chain
-// validation.
-func TestRenewalRejectsExpiredCA(t *testing.T) {
+// TestExistingStateProvisioningRejectsExpiredCA proves existing-state
+// provisioning rejects a CA that has expired rather than returning material
+// that clients would reject during chain validation.
+func TestExistingStateProvisioningRejectsExpiredCA(t *testing.T) {
 	dir := t.TempDir()
 	dataDir := filepath.Join(dir, "data")
 	now := time.Date(2026, 8, 8, 0, 0, 0, 0, time.UTC)
@@ -765,42 +730,11 @@ func TestRenewalRejectsExpiredCA(t *testing.T) {
 	}
 }
 
-// TestRenewalCapsLeafNotAfterAtCA proves a leaf is never issued with a NotAfter
-// beyond the CA's own NotAfter: when the CA is near expiry, the leaf NotAfter is
-// capped to the CA NotAfter.
-func TestRenewalCapsLeafNotAfterAtCA(t *testing.T) {
-	dir := t.TempDir()
-	dataDir := filepath.Join(dir, "data")
-	now := time.Date(2026, 8, 8, 0, 0, 0, 0, time.UTC)
-
-	ks1 := newFakeMachineKeyStore(true, true)
-	if _, err := ProvisionWithKeyStore(dataDir, ks1, okTrustStore(), fixedNow(now)); err != nil {
-		t.Fatalf("first provision: %v", err)
-	}
-
-	// Renew close to CA expiry so the nominal leaf validity would exceed it.
-	renewTime := now.Add(caValidity - 15*24*time.Hour)
-	ks2 := newFakeMachineKeyStore(true, true)
-	ks2.caSigner = ks1.caSigner
-	ks2.serverSigner = ks1.serverSigner
-
-	m2, err := ProvisionWithKeyStore(dataDir, ks2, okTrustStore(), fixedNow(renewTime))
-	if err != nil {
-		t.Fatalf("renew near CA expiry: %v", err)
-	}
-	if m2.ServerCertificate.NotAfter.After(m2.CACertificate.NotAfter) {
-		t.Fatalf("leaf NotAfter %v exceeds CA NotAfter %v", m2.ServerCertificate.NotAfter, m2.CACertificate.NotAfter)
-	}
-	if !m2.ServerCertificate.NotAfter.Equal(m2.CACertificate.NotAfter) {
-		t.Fatalf("leaf NotAfter = %v, want capped to CA NotAfter %v", m2.ServerCertificate.NotAfter, m2.CACertificate.NotAfter)
-	}
-}
-
-// TestRenewalRejectsNotYetValidCA proves the renewal path rejects a CA whose
-// NotBefore is in the future relative to the renewal time. It exercises the
-// actual renewal path (not just validateCALifetime) and verifies no replacement
-// CA identity is silently generated.
-func TestRenewalRejectsNotYetValidCA(t *testing.T) {
+// TestExistingStateProvisioningRejectsNotYetValidCA proves existing-state
+// provisioning rejects a CA whose NotBefore is in the future relative to now.
+// It exercises ProvisionWithKeyStore (not just validateCA) and verifies no
+// replacement CA identity is silently generated.
+func TestExistingStateProvisioningRejectsNotYetValidCA(t *testing.T) {
 	dir := t.TempDir()
 	dataDir := filepath.Join(dir, "data")
 	tlsDir := filepath.Join(dataDir, tlsSubDir)

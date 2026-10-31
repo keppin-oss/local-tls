@@ -4,6 +4,7 @@ package localtls
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -155,6 +156,25 @@ func TestMapCNGErrorNotFoundWrapped(t *testing.T) {
 	}
 	if !errors.Is(mapCNGError(underlying), ErrKeyNotFound) {
 		t.Fatalf("mapCNGError(wrapped) must map to ErrKeyNotFound")
+	}
+}
+
+// TestMapCNGErrorKeepsNativeHRESULT verifies the mapped error keeps the key
+// name and native HRESULT that windowscng v0.2.0 puts in its wrapping error,
+// while remaining matchable as ErrKeyNotFound and not leaking the sentinel.
+func TestMapCNGErrorKeepsNativeHRESULT(t *testing.T) {
+	underlying := fmt.Errorf("key %q: NCryptOpenKey hr=0x%x: %w", serverKeyName, uint32(0x80090016), windowscng.ErrKeyNotFound)
+	err := mapCNGError(underlying)
+	if !errors.Is(err, ErrKeyNotFound) {
+		t.Fatalf("mapped error must match ErrKeyNotFound: %v", err)
+	}
+	if errors.Is(err, windowscng.ErrKeyNotFound) {
+		t.Fatal("mapped error must not leak the windowscng sentinel")
+	}
+	for _, want := range []string{"hr=0x80090016", serverKeyName} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("mapped error %q lost %q", err, want)
+		}
 	}
 }
 

@@ -13,6 +13,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/keppin-oss/cng/windowscng"
 	"github.com/keppin-oss/local-tls/internal/identity"
 )
 
@@ -59,7 +60,8 @@ func (smokeKeyDeleter) DeleteCAKey() error     { return deleteProductionKey(Smok
 func (smokeKeyDeleter) DeleteServerKey() error { return deleteProductionKey(SmokeServerKeyName) }
 
 // TestCleanupLifecycleElevated proves the full provision → verify → cleanup →
-// verify-absent lifecycle against test-only smoke namespaces, and repeats it to
+// post-cleanup check lifecycle against test-only smoke namespaces (cleanup is
+// confirmed by successful deletes, never by a not-found re-open), and repeats it to
 // prove repeatability. It requires Administrator elevation and is skipped
 // (reported NOT EXECUTED) only when the elevation prerequisite is absent.
 //
@@ -83,57 +85,90 @@ func TestCleanupLifecycleElevated(t *testing.T) {
 	}
 }
 
+// smokeElevationDeps are the key operations establishSmokeElevation uses. The
+// elevated test uses TestOpenKey, TestCreateKey and TestDeleteKey; offline
+// tests substitute fakes so the SKIP/FAIL classification is covered without
+// touching a machine key.
+type smokeElevationDeps struct {
+	name   func() (string, error)
+	open   func(string) (crypto.Signer, error)
+	create func(string) (crypto.Signer, error)
+	del    func(string) error
+}
+
 // establishSmokeElevation verifies the elevated CNG prerequisite by creating
 // and deleting a disposable, uniquely-named smoke-namespace test key.
+func establishSmokeElevation() (unavailable bool, err error) {
+	return establishSmokeElevationWith(smokeElevationDeps{
+		name:   uniqueSmokeProbeName,
+		open:   TestOpenKey,
+		create: TestCreateKey,
+		del:    TestDeleteKey,
+	})
+}
+
+// establishSmokeElevationWith is the body of establishSmokeElevation.
 //
 // It returns two values that distinguish the two failure classes:
 //
 //   - unavailable == true: the elevation prerequisite (Administrator CNG write
-//     access) is explicitly absent — the caller should SKIP.
+//     access) is explicitly absent: creating the probe key was denied and CNG
+//     reported no failed cleanup of a key created by that call. The caller
+//     should SKIP.
 //   - unavailable == false && err != nil: an operational failure occurred (for
-//     example a signer-close or key-deletion failure after ownership was
-//     established) — the caller must FAIL.
+//     example a signer-close or key-deletion failure after the key was
+//     created) — the caller must FAIL.
 //
-// Ownership of the probe key is established by construction: a fresh unique name
-// is generated, an open-only preflight must report the key as absent
-// (ErrKeyNotFound), and only then is the key created. A pre-existing key is
-// never reused or deleted, and any unexpected preflight/open error is returned
-// as an operational error rather than converted into absence.
-func establishSmokeElevation() (unavailable bool, err error) {
-	probeName, err := uniqueSmokeProbeName()
+// The probe key name is fresh and random, and an open-only preflight must
+// report ErrKeyNotFound before the key is created. ErrKeyNotFound means "not
+// found or not accessible", so the preflight does not prove absence; the
+// random name is what makes a pre-existing key with that name implausible. A
+// key that opens is never reused or deleted, and any other preflight error is
+// operational.
+//
+// Cleanup is confirmed only by a successful delete. A delete that reports
+// ErrKeyNotFound did not delete anything and is an operational failure
+// (ErrKeyDeletionUnconfirmed), never a skip and never a success.
+func establishSmokeElevationWith(deps smokeElevationDeps) (unavailable bool, err error) {
+	probeName, err := deps.name()
 	if err != nil {
 		return false, err
 	}
 
-	// Open-only preflight: the unique name must be absent before we create it.
-	if err := probeKeyOwnership(TestOpenKey, probeName); err != nil {
+	// Open-only preflight on the fresh name.
+	if err := probeKeyOwnership(deps.open, probeName); err != nil {
 		return false, err
 	}
 
-	// Create the previously-absent unique key. Ownership is established only
-	// after this succeeds (the key was confirmed absent a moment ago).
-	signer, err := TestCreateKey(probeName)
+	// Create the probe key. Only a denied create is the missing prerequisite.
+	// A create error does not prove that no key was created: when CNG reports
+	// that deleting the key created by the failed call also failed, that key
+	// may persist under the exact probe name. That is an operational failure
+	// and takes precedence over the text-based prerequisite check (the
+	// access-denied text may belong to either part). Nothing is deleted here:
+	// the error names the exact probe key for inspection.
+	signer, err := deps.create(probeName)
 	if err != nil {
+		if createCleanupFailed(err) {
+			return false, fmt.Errorf("create elevation probe key %q failed and the key created by that call may persist (CNG cleanup failed); inspect and remove that exact key: %w", probeName, err)
+		}
 		if isElevationUnavailable(err) {
 			return true, err
 		}
 		return false, err
 	}
 
-	// Ownership is established. Any failure from here on is operational and must
-	// fail the test. Cleanup-attempt the owned probe key even if a later step
-	// fails, and surface a failed cleanup rather than discarding it.
-	cleanupDone := false
+	// The probe key was created by this call. Any failure from here on is
+	// operational and must fail the test. If the regular delete below is not
+	// reached, still attempt it once and surface its result.
+	deleteAttempted := false
 	defer func() {
-		if !cleanupDone {
-			if delErr := TestDeleteKey(probeName); delErr != nil && !errors.Is(delErr, ErrKeyNotFound) {
-				if err != nil {
-					err = fmt.Errorf("%w; cleanup delete elevation probe key: %v", err, delErr)
-				} else {
-					err = fmt.Errorf("cleanup delete elevation probe key: %v", delErr)
-				}
-				unavailable = false
-			}
+		if deleteAttempted {
+			return
+		}
+		if delErr := deps.del(probeName); delErr != nil {
+			err = errors.Join(err, keyCleanupError(fmt.Sprintf("cleanup delete elevation probe key %q", probeName), delErr))
+			unavailable = false
 		}
 	}()
 
@@ -141,11 +176,19 @@ func establishSmokeElevation() (unavailable bool, err error) {
 		return false, fmt.Errorf("close elevation probe key: %w", cerr)
 	}
 
-	if delErr := TestDeleteKey(probeName); delErr != nil && !errors.Is(delErr, ErrKeyNotFound) {
-		return false, fmt.Errorf("delete elevation probe key: %w", delErr)
+	deleteAttempted = true
+	if delErr := deps.del(probeName); delErr != nil {
+		return false, keyCleanupError(fmt.Sprintf("delete elevation probe key %q", probeName), delErr)
 	}
-	cleanupDone = true
 	return false, nil
+}
+
+// createCleanupFailed reports whether a create error says that the key created
+// by the failed call could not be deleted (windowscng.ErrCleanupFailed). The
+// sentinel is matched in the chain and, because mapCNGError flattens a chain
+// that also carries windowscng.ErrKeyNotFound into text, by its exact message.
+func createCleanupFailed(err error) bool {
+	return errors.Is(err, windowscng.ErrCleanupFailed) || strings.Contains(err.Error(), windowscng.ErrCleanupFailed.Error())
 }
 
 // isElevationUnavailable reports whether err indicates the process lacks the
@@ -181,10 +224,10 @@ func uniqueSmokeProbeName() (string, error) {
 }
 
 // probeKeyOwnership classifies the open-only preflight for a unique probe key
-// name. It returns nil only when the key is absent (ErrKeyNotFound). A key that
-// unexpectedly already exists is closed and reported as an error (ownership is
-// not established and the key must not be deleted). Any other open error is
-// returned unchanged (wrapped).
+// name. It returns nil only for ErrKeyNotFound ("not found or not accessible";
+// not a proof of absence, see establishSmokeElevationWith). A key that
+// unexpectedly opens is closed and reported as an error (the key is not ours
+// and must not be deleted). Any other open error is returned wrapped.
 func probeKeyOwnership(open func(string) (crypto.Signer, error), name string) error {
 	signer, err := open(name)
 	if err == nil {
@@ -198,9 +241,11 @@ func probeKeyOwnership(open func(string) (crypto.Signer, error), name string) er
 }
 
 // runSmokeLifecycle executes one full provision → verify → cleanup →
-// verify-absent cycle against disposable test-owned artifacts. It registers
-// machine-artifact cleanup immediately after successful provisioning so that a
-// later failure cannot leave test-owned CNG keys or a trust anchor behind.
+// post-cleanup check cycle against disposable test-owned artifacts. It
+// registers a fallback machine-artifact cleanup immediately after successful
+// provisioning so that a later failure does not silently leave test-owned CNG
+// keys or a trust anchor behind; the fallback reports what it could not
+// confirm.
 func runSmokeLifecycle(t *testing.T) error {
 	root := t.TempDir()
 	tlsDir := filepath.Join(root, tlsSubDir)
@@ -210,16 +255,25 @@ func runSmokeLifecycle(t *testing.T) error {
 		return fmt.Errorf("ProvisionSmoke: %w", err)
 	}
 
-	// Register machine-artifact cleanup immediately after successful
-	// provisioning. The state directory is owned by t.TempDir() and removed by
-	// the test framework; the CNG keys and trust anchor are not.
+	// Fallback cleanup, needed only when cleanupLocalTLS below did not confirm
+	// both key deletions. The state directory is owned by t.TempDir() and
+	// removed by the test framework; the CNG keys and trust anchor are not.
+	cleanupConfirmed := false
 	t.Cleanup(func() {
-		trustStore, tsErr := PlatformTrustStore()
-		if tsErr == nil {
-			_ = trustStore.RemoveTrust(material.CACertificate.Raw)
+		if cleanupConfirmed {
+			return
 		}
-		_ = TestDeleteKey(SmokeCAKeyName)
-		_ = TestDeleteKey(SmokeServerKeyName)
+		trustStore, tsErr := PlatformTrustStore()
+		if tsErr != nil {
+			t.Errorf("fallback cleanup: PlatformTrustStore: %v", tsErr)
+		} else if err := trustStore.RemoveTrust(material.CACertificate.Raw); err != nil && !errors.Is(err, ErrTrustAnchorNotFound) {
+			t.Errorf("fallback cleanup: remove smoke trust anchor: %v", err)
+		}
+		for _, name := range []string{SmokeCAKeyName, SmokeServerKeyName} {
+			if err := TestDeleteKey(name); err != nil {
+				t.Errorf("fallback cleanup: %v", keyCleanupError(fmt.Sprintf("delete smoke key %q", name), err))
+			}
+		}
 		_ = os.RemoveAll(root)
 	})
 
@@ -236,11 +290,14 @@ func runSmokeLifecycle(t *testing.T) error {
 		return fmt.Errorf("expected TrustHealthy, got %s", state)
 	}
 
+	// cleanupLocalTLS returns nil only when both key deletes succeeded; an
+	// ErrKeyNotFound delete is ErrKeyDeletionUnconfirmed and fails here.
 	if err := cleanupLocalTLS(tlsDir, smokeKeyDeleter{}, func() error {
 		return trustStore.RemoveTrust(material.CACertificate.Raw)
 	}); err != nil {
 		return fmt.Errorf("cleanupLocalTLS: %w", err)
 	}
+	cleanupConfirmed = true
 
 	found, err := trustStore.IsTrustedSHA256(material.CAFingerprintSHA256)
 	if err != nil {
@@ -250,10 +307,19 @@ func runSmokeLifecycle(t *testing.T) error {
 		return fmt.Errorf("trust anchor still present after cleanup")
 	}
 
-	for _, name := range []string{SmokeCAKeyName, SmokeServerKeyName} {
-		_, err := TestOpenKey(name)
+	return checkSmokeKeysNotOpenable(TestOpenKey, SmokeCAKeyName, SmokeServerKeyName)
+}
+
+// checkSmokeKeysNotOpenable is the post-cleanup consistency check. Deletion is
+// already confirmed by the successful deletes; this only catches a key that
+// still opens or an unexpected open error. ErrKeyNotFound is consistent with
+// the confirmed deletion but is not, by itself, proof that the key is absent.
+func checkSmokeKeysNotOpenable(open func(string) (crypto.Signer, error), names ...string) error {
+	for _, name := range names {
+		signer, err := open(name)
 		if err == nil {
-			return fmt.Errorf("smoke key %q still present after cleanup", name)
+			_ = closeSigner(signer)
+			return fmt.Errorf("smoke key %q still opens after confirmed deletion", name)
 		}
 		if !errors.Is(err, ErrKeyNotFound) {
 			return fmt.Errorf("unexpected error opening smoke key %q after cleanup: %w", name, err)
@@ -335,5 +401,216 @@ func TestIsElevationUnavailable(t *testing.T) {
 				t.Fatalf("isElevationUnavailable(%v) = %v, want %v", tc.err, got, tc.want)
 			}
 		})
+	}
+}
+
+// ---- elevation probe SKIP/FAIL classification (offline fakes, no machine key) ----
+
+// fakeElevationKeys records the key operations establishSmokeElevationWith
+// performs and returns configured results.
+type fakeElevationKeys struct {
+	nameErr   error
+	openErr   error
+	openKey   *fakeCloseSigner
+	createErr error
+	created   *fakeCloseSigner
+	delErrs   []error // result of each successive delete; nil once exhausted
+	opens     []string
+	creates   []string
+	deletes   []string
+}
+
+func (f *fakeElevationKeys) deps() smokeElevationDeps {
+	return smokeElevationDeps{
+		name: func() (string, error) {
+			if f.nameErr != nil {
+				return "", f.nameErr
+			}
+			return identity.SmokeKeyNamespace + "elevation-probe-offline", nil
+		},
+		open: func(name string) (crypto.Signer, error) {
+			f.opens = append(f.opens, name)
+			if f.openKey != nil {
+				return f.openKey, nil
+			}
+			if f.openErr != nil {
+				return nil, f.openErr
+			}
+			return nil, fmt.Errorf("%w: key %q: hr=0x80090016", ErrKeyNotFound, name)
+		},
+		create: func(name string) (crypto.Signer, error) {
+			f.creates = append(f.creates, name)
+			if f.createErr != nil {
+				return nil, f.createErr
+			}
+			f.created = newFakeCloseSigner()
+			return f.created, nil
+		},
+		del: func(name string) error {
+			f.deletes = append(f.deletes, name)
+			if i := len(f.deletes) - 1; i < len(f.delErrs) {
+				return f.delErrs[i]
+			}
+			return nil
+		},
+	}
+}
+
+// TestEstablishSmokeElevationClassification proves the probe contract offline: a
+// denied create is the only SKIP, every failure after the probe key was
+// created is an operational FAIL, a delete reporting ErrKeyNotFound is an
+// unconfirmed deletion (never success, never SKIP), and success requires a
+// confirmed delete of exactly the created key.
+func TestEstablishSmokeElevationClassification(t *testing.T) {
+	notFound := fmt.Errorf("%w: key %q: hr=0x80090016", ErrKeyNotFound, "probe")
+	accessDenied := errors.New("NCryptFinalizeKey: hr=0x80090010")
+	closeErr := errors.New("handle close failed")
+	inUse := errors.New("key in use")
+
+	cases := []struct {
+		name            string
+		keys            *fakeElevationKeys
+		wantUnavailable bool
+		wantErr         []error // each must match; empty means success
+		wantCreates     int
+		wantDeletes     int
+	}{
+		{"confirmed delete succeeds", &fakeElevationKeys{}, false, nil, 1, 1},
+		{"name generation fails", &fakeElevationKeys{nameErr: errors.New("rng")}, false, []error{}, 0, 0},
+		{"preflight opens a key", &fakeElevationKeys{openKey: newFakeCloseSigner()}, false, []error{}, 0, 0},
+		{"preflight unexpected error", &fakeElevationKeys{openErr: inUse}, false, []error{inUse}, 0, 0},
+		{"create denied is the prerequisite", &fakeElevationKeys{createErr: accessDenied}, true, []error{accessDenied}, 1, 0},
+		{"create other error", &fakeElevationKeys{createErr: inUse}, false, []error{inUse}, 1, 0},
+		{"delete not found is unconfirmed", &fakeElevationKeys{delErrs: []error{notFound}}, false, []error{ErrKeyDeletionUnconfirmed, ErrKeyNotFound}, 1, 1},
+		{"delete access denied is operational", &fakeElevationKeys{delErrs: []error{accessDenied}}, false, []error{accessDenied}, 1, 1},
+		{"delete other error", &fakeElevationKeys{delErrs: []error{inUse}}, false, []error{inUse}, 1, 1},
+		{"close fails, cleanup delete confirmed", &fakeElevationKeys{}, false, []error{closeErr}, 1, 1},
+		{"close fails, cleanup delete not found", &fakeElevationKeys{delErrs: []error{notFound}}, false, []error{closeErr, ErrKeyDeletionUnconfirmed, ErrKeyNotFound}, 1, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			deps := tc.keys.deps()
+			if strings.HasPrefix(tc.name, "close fails") {
+				create := deps.create
+				deps.create = func(name string) (crypto.Signer, error) {
+					s, err := create(name)
+					tc.keys.created.closeErr = closeErr
+					return s, err
+				}
+			}
+
+			unavailable, err := establishSmokeElevationWith(deps)
+			if unavailable != tc.wantUnavailable {
+				t.Fatalf("unavailable = %v, want %v (err %v)", unavailable, tc.wantUnavailable, err)
+			}
+			if tc.wantErr == nil {
+				if err != nil {
+					t.Fatalf("err = %v, want nil", err)
+				}
+			} else {
+				if err == nil {
+					t.Fatal("err = nil, want a failure")
+				}
+				for _, want := range tc.wantErr {
+					if !errors.Is(err, want) {
+						t.Fatalf("err = %v, want it to match %v", err, want)
+					}
+				}
+			}
+			if len(tc.keys.creates) != tc.wantCreates || len(tc.keys.deletes) != tc.wantDeletes {
+				t.Fatalf("creates=%d deletes=%d, want %d/%d", len(tc.keys.creates), len(tc.keys.deletes), tc.wantCreates, tc.wantDeletes)
+			}
+			for _, d := range tc.keys.deletes {
+				if len(tc.keys.creates) != 1 || d != tc.keys.creates[0] {
+					t.Fatalf("deleted %q, which is not the key this call created (%v)", d, tc.keys.creates)
+				}
+			}
+			if tc.keys.created != nil && tc.keys.created.closeErr == nil && tc.keys.created.closeCount == 0 {
+				t.Fatal("the created probe signer must be closed")
+			}
+			if tc.keys.openKey != nil && !tc.keys.openKey.closed {
+				t.Fatal("a key opened by the preflight must be closed and left in place")
+			}
+		})
+	}
+}
+
+// TestEstablishSmokeElevationCreateCleanupFailed proves that a create error
+// reporting a failed CNG cleanup (windowscng.ErrCleanupFailed: the key created
+// by the failed call may persist) is an operational FAIL even when
+// access-denied text appears in the original failure or only in the cleanup
+// part, including after mapCNGError has flattened the chain to text. The
+// original causes and the exact probe name are kept, and nothing is deleted.
+// An ordinary denied create without a cleanup failure stays the SKIP
+// prerequisite.
+func TestEstablishSmokeElevationCreateCleanupFailed(t *testing.T) {
+	accessDenied := errors.New("NCryptFinalizeKey: hr=0x80090010")
+	cleanupDenied := fmt.Errorf("%w: NCryptDeleteKey: hr=0x80090010", windowscng.ErrCleanupFailed)
+	validationErr := errors.New("created key failed post-creation validation")
+	flattened := mapCNGError(errors.Join(
+		fmt.Errorf("%w: reopen created key", windowscng.ErrKeyNotFound),
+		fmt.Errorf("%w: access denied", windowscng.ErrCleanupFailed),
+	))
+	if errors.Is(flattened, windowscng.ErrCleanupFailed) {
+		t.Fatal("fixture: mapCNGError was expected to flatten this chain to text")
+	}
+
+	cases := []struct {
+		name            string
+		createErr       error
+		wantUnavailable bool
+		wantIs          []error
+	}{
+		{"denied create with failed cleanup", errors.Join(accessDenied, fmt.Errorf("%w: delete failed", windowscng.ErrCleanupFailed)),
+			false, []error{accessDenied, windowscng.ErrCleanupFailed}},
+		{"denial only in the cleanup part", errors.Join(validationErr, cleanupDenied),
+			false, []error{validationErr, windowscng.ErrCleanupFailed}},
+		{"failed cleanup flattened by mapCNGError", flattened,
+			false, []error{ErrKeyNotFound}},
+		{"ordinary denied create", accessDenied,
+			true, []error{accessDenied}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			keys := &fakeElevationKeys{createErr: tc.createErr}
+			unavailable, err := establishSmokeElevationWith(keys.deps())
+			if unavailable != tc.wantUnavailable {
+				t.Fatalf("unavailable = %v, want %v (err %v)", unavailable, tc.wantUnavailable, err)
+			}
+			for _, want := range tc.wantIs {
+				if !errors.Is(err, want) {
+					t.Fatalf("err = %v, want the original cause %v kept", err, want)
+				}
+			}
+			if !tc.wantUnavailable {
+				if len(keys.creates) != 1 || !strings.Contains(err.Error(), keys.creates[0]) {
+					t.Fatalf("err = %v, want it to name the exact probe key %v", err, keys.creates)
+				}
+			}
+			if len(keys.opens) != 1 || len(keys.creates) != 1 || len(keys.deletes) != 0 {
+				t.Fatalf("opens=%d creates=%d deletes=%d, want 1/1/0 (no key deleted on this path)", len(keys.opens), len(keys.creates), len(keys.deletes))
+			}
+		})
+	}
+}
+
+// TestCheckSmokeKeysNotOpenable proves the post-cleanup check fails on a key
+// that still opens (closing it) or on an unexpected open error, and accepts
+// ErrKeyNotFound only as consistent with an already-confirmed deletion.
+func TestCheckSmokeKeysNotOpenable(t *testing.T) {
+	notFound := func(string) (crypto.Signer, error) { return nil, ErrKeyNotFound }
+	if err := checkSmokeKeysNotOpenable(notFound, "a", "b"); err != nil {
+		t.Fatalf("not found after confirmed deletion: %v", err)
+	}
+
+	signer := newFakeCloseSigner()
+	err := checkSmokeKeysNotOpenable(func(string) (crypto.Signer, error) { return signer, nil }, "a")
+	if err == nil || !signer.closed {
+		t.Fatalf("still-opening key: err = %v, closed = %v; want error and closed signer", err, signer.closed)
+	}
+
+	inUse := errors.New("key in use")
+	if err := checkSmokeKeysNotOpenable(func(string) (crypto.Signer, error) { return nil, inUse }, "a"); !errors.Is(err, inUse) {
+		t.Fatalf("unexpected open error: err = %v, want it wrapped", err)
 	}
 }

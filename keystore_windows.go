@@ -5,6 +5,7 @@ package localtls
 import (
 	"crypto"
 	"errors"
+	"fmt"
 
 	"github.com/keppin-oss/cng/windowscng"
 	"github.com/keppin-oss/local-tls/internal/identity"
@@ -79,19 +80,21 @@ func openProductionKey(name string) (crypto.Signer, error) {
 
 // deleteProductionKey deletes exactly one persisted production CNG key by name.
 // It never creates a key and never performs wildcard/prefix deletion. Returns
-// ErrKeyNotFound when the exact key does not exist (idempotent cleanup).
+// ErrKeyNotFound when the exact key was not found or is not accessible; that
+// means nothing was deleted, not that the key is absent.
 func deleteProductionKey(name string) error {
 	return mapCNGError(windowscng.Delete(name))
 }
 
-// mapCNGError translates the shared windowscng missing-key sentinel into the
-// Local-TLS ErrKeyNotFound contract so callers never need to know windowscng's
-// sentinel. Permission, corruption, incompatible-key, ACL, and other unexpected
-// failures are passed through unchanged and are never converted into
-// not-found.
+// mapCNGError translates the shared windowscng not-found-or-inaccessible
+// sentinel into the Local-TLS ErrKeyNotFound contract so callers never need to
+// know windowscng's sentinel. The shared error's message, which carries the key
+// name and the native key-open HRESULT, is kept for diagnosis. Permission,
+// corruption, incompatible-key, ACL, and other unexpected failures are passed
+// through unchanged and are never converted into not-found.
 func mapCNGError(err error) error {
 	if errors.Is(err, windowscng.ErrKeyNotFound) {
-		return ErrKeyNotFound
+		return fmt.Errorf("%w: %s", ErrKeyNotFound, err)
 	}
 	return err
 }
