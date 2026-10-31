@@ -15,12 +15,16 @@ import (
 //  3. the exact persisted Local-TLS server CNG key;
 //  4. the Local-TLS-owned TLS state directory (...\Agent\tls).
 //
-// It is suitable for an elevated installer/uninstaller/repair context and is
-// idempotent for artifacts that are already absent.
+// It is suitable for an elevated installer/uninstaller context. An
+// already-absent trust anchor or state directory is idempotent success.
 //
 // Cleanup is best-effort across independently removable artifacts, but every
 // failure that cannot be attributed to "already absent" is returned so that a
 // security-sensitive artifact failure is never silently reported as success.
+// A key reported as not found or not accessible is not proof of deletion: it is
+// returned as ErrKeyDeletionUnconfirmed, and the TLS state directory (with the
+// CA DER) is then retained for recovery. Cleanup therefore returns nil only when
+// both key deletions were confirmed.
 //
 // Trust-anchor removal is by exact SHA-256 fingerprint derived from the on-disk
 // CA certificate. If the CA certificate DER (and thus the state directory) is

@@ -28,22 +28,6 @@ const (
 	RenewalThreshold = 30 * 24 * time.Hour
 )
 
-// generateCA creates a CA certificate and private key using an ephemeral key.
-func generateCA(now time.Time) (*x509.Certificate, *ecdsa.PrivateKey, error) {
-	if now.IsZero() {
-		now = time.Now()
-	}
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return nil, nil, fmt.Errorf("generate CA private key: %w", err)
-	}
-	cert, err := createCACertSelfSigned(now, key)
-	if err != nil {
-		return nil, nil, err
-	}
-	return cert, key, nil
-}
-
 // generateCAWithSigner creates a self-signed CA certificate using a crypto.Signer
 // for the CA key. The signer must be an ECDSA P-256 key.
 func generateCAWithSigner(now time.Time, signer crypto.Signer) (*x509.Certificate, error) {
@@ -87,23 +71,6 @@ func createCACertSelfSigned(now time.Time, signer crypto.Signer) (*x509.Certific
 	return cert, nil
 }
 
-// generateServerCert creates a server certificate and ephemeral private key,
-// signed by the CA key. Used only for testing with exported keys.
-func generateServerCert(now time.Time, caCert *x509.Certificate, caKey crypto.Signer) (*x509.Certificate, *ecdsa.PrivateKey, error) {
-	if now.IsZero() {
-		now = time.Now()
-	}
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return nil, nil, fmt.Errorf("generate server private key: %w", err)
-	}
-	cert, err := createServerCertWithPub(now, caCert, caKey, &key.PublicKey)
-	if err != nil {
-		return nil, nil, err
-	}
-	return cert, key, nil
-}
-
 // generateServerCertWithSigner creates a server certificate signed by the CA signer,
 // using a crypto.Signer for the server's public key. The server signer must be ECDSA P-256.
 func generateServerCertWithSigner(now time.Time, caCert *x509.Certificate, caSigner, serverSigner crypto.Signer) (*x509.Certificate, error) {
@@ -129,7 +96,7 @@ func createServerCertWithPub(now time.Time, caCert *x509.Certificate, caSigner c
 			Organization: []string{serverOrg},
 		},
 		NotBefore:   now.Add(-5 * time.Minute),
-		NotAfter:    cappedServerNotAfter(now, caCert),
+		NotAfter:    now.Add(serverValidity),
 		DNSNames:    []string{"localhost"},
 		IPAddresses: []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback},
 		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
@@ -159,31 +126,6 @@ func randomSerial() (*big.Int, error) {
 	return serial, nil
 }
 
-// cappedServerNotAfter returns the NotAfter for a server certificate issued at
-// now by caCert. It caps the nominal server validity (now + serverValidity) at
-// the CA's own NotAfter so a leaf never outlives the CA that signs it.
-func cappedServerNotAfter(now time.Time, caCert *x509.Certificate) time.Time {
-	notAfter := now.Add(serverValidity)
-	if notAfter.After(caCert.NotAfter) {
-		return caCert.NotAfter
-	}
-	return notAfter
-}
-
-// validateCALifetime returns an error when the CA certificate is not currently
-// valid (not yet valid or already expired). A CA in either state cannot safely
-// issue a new leaf; CA recovery/reprovisioning is required, and the CA identity
-// must never be silently replaced.
-func validateCALifetime(caCert *x509.Certificate, now time.Time) error {
-	if now.Before(caCert.NotBefore) {
-		return fmt.Errorf("CA certificate is not yet valid (NotBefore %s): CA recovery/reprovisioning required", caCert.NotBefore.UTC())
-	}
-	if !now.Before(caCert.NotAfter) {
-		return fmt.Errorf("CA certificate has expired (NotAfter %s): CA recovery/reprovisioning required", caCert.NotAfter.UTC())
-	}
-	return nil
-}
-
 func verifyPublicKeyMatch(cert *x509.Certificate, pub crypto.PublicKey) error {
 	switch certPub := cert.PublicKey.(type) {
 	case *ecdsa.PublicKey:
@@ -200,34 +142,10 @@ func verifyPublicKeyMatch(cert *x509.Certificate, pub crypto.PublicKey) error {
 	}
 }
 
-func verifyKeyMatch(cert *x509.Certificate, key interface{}) error {
-	switch pub := cert.PublicKey.(type) {
-	case *ecdsa.PublicKey:
-		priv, ok := key.(*ecdsa.PrivateKey)
-		if !ok {
-			return fmt.Errorf("key type is %T, expected *ecdsa.PrivateKey", key)
-		}
-		if pub.X.Cmp(priv.X) != 0 || pub.Y.Cmp(priv.Y) != 0 {
-			return fmt.Errorf("private key does not match certificate public key")
-		}
-		return nil
-	default:
-		return fmt.Errorf("unsupported public key type %T", pub)
-	}
-}
-
 func tlsCertFromSigner(cert *x509.Certificate, signer crypto.Signer) tls.Certificate {
 	return tls.Certificate{
 		Certificate: [][]byte{cert.Raw},
 		PrivateKey:  signer,
-		Leaf:        cert,
-	}
-}
-
-func tlsCertFromMaterial(cert *x509.Certificate, key *ecdsa.PrivateKey) tls.Certificate {
-	return tls.Certificate{
-		Certificate: [][]byte{cert.Raw},
-		PrivateKey:  key,
 		Leaf:        cert,
 	}
 }

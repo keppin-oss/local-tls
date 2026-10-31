@@ -9,6 +9,9 @@ Every claim in this document is traceable to the source, the tests, the build
 tags, or `go.mod`. Where a behavior is not demonstrable from this repository, it
 is labeled explicitly.
 
+Upgrading from v0.1.x? Read [Upgrading from v0.1.x](#upgrading-from-v01x)
+first: v0.2.0 contains intentional breaking behavior changes.
+
 ---
 
 ## How to read this document
@@ -38,14 +41,15 @@ and composes three platform seams:
    `github.com/keppin-oss/cng` module (`windowscng` package).
 2. **Trust store** — `TrustProvisioner` / `TrustVerifier`, backed on Windows by
    `LocalMachine\Root` via CryptoAPI.
-3. **Certificate material** — generated and validated in-process (`certificate.go`
-   and `provision.go`); on the production machine path only public DER is
-   persisted.
+3. **Certificate material** — generated and validated in-process
+   (`certificate.go`, `validate.go`, `provision.go`, `renewal.go`); only public
+   DER is persisted.
 
 The composition layer (`composition_windows.go`) wires these seams into the
 production entry points (`ProvisionMachine`, `ReloadMachine`,
-`LoadServingMaterial`) and the cleanup entry points (`CleanupMachine`,
-`CleanupMachineBySHA256`).
+`LoadServingMaterial`), the staged renewal entry points (`StageServerRenewal`,
+`LoadServingCandidate`, `ConfirmServingCandidate`, `AbandonServingCandidate`)
+and the cleanup entry points (`CleanupMachine`, `CleanupMachineBySHA256`).
 
 ```
 examples/            runnable, compile-safe examples
@@ -68,7 +72,8 @@ internal/identity/   fixed persisted identity constants (key names, DNs, paths)
 - enterprise CA enrollment or enterprise-vs-local selection policy;
 - low-level reusable CNG/KSP key custody — that is the `github.com/keppin-oss/cng`
   module (`windowscng`);
-- the long-lived HTTPS listener / server runtime;
+- the long-lived HTTPS listener / server runtime, including activation of a
+  renewed certificate in that listener;
 - authorization, machine identity, tenant, installation, licensing, or unrelated
   application state.
 
@@ -82,17 +87,31 @@ trust-store framework.
   explicit unsupported-platform errors (see
   [Windows / platform behavior](#windows--platform-behavior)).
 - **Administrator elevation** is required for `ProvisionMachine`, `CleanupMachine`,
-  and `CleanupMachineBySHA256`. `LoadServingMaterial`, `ReloadMachine`, and
-  read-only trust verification do not mutate machine trust and do not require
-  elevation, but the calling process must be able to open the persisted server key
-  (caller responsibility).
+  and `CleanupMachineBySHA256` (caller responsibility). On first install,
+  `ProvisionMachine` itself fails closed for a caller that is not LocalSystem or
+  an elevated Administrator, or whose privilege cannot be determined (policy).
+  `LoadServingMaterial`, `LoadServingCandidate`, `ReloadMachine`, and read-only
+  trust verification do not mutate machine trust and do not require elevation,
+  but the calling process must be able to open the persisted key(s) they use
+  (caller responsibility). The renewal steps that write (`StageServerRenewal`,
+  `ConfirmServingCandidate`, `AbandonServingCandidate`) need write access to the
+  TLS state directory; `StageServerRenewal` also opens the CA key.
+- **Single lifecycle writer** (caller responsibility). One lifecycle coordinator
+  per machine must ensure that provisioning, cleanup/uninstall, administrative
+  recovery and every server-certificate renewal attempt (the whole sequence
+  `StageServerRenewal` → `LoadServingCandidate` → consumer activation and
+  attestation → `ConfirmServingCandidate` or `AbandonServingCandidate`) never
+  overlap, and that no other actor creates, deletes or re-permissions the
+  Local TLS key names or state directory while they run. Local TLS does **not**
+  implement or verify this serialization. The digest checks of the renewal API
+  detect some violations, not all; they are not a lock.
 - **Microsoft Software Key Storage Provider** is the only supported key store.
 - **Go** — the module declares `go 1.26.8`.
 
 ### Dependencies
 
 ```
-github.com/keppin-oss/cng v0.1.2      // windowscng — CNG/KSP key custody
+github.com/keppin-oss/cng v0.2.0      // windowscng — CNG/KSP key custody
 golang.org/x/sys        v0.47.0       // Windows syscall bindings
 ```
 
@@ -116,10 +135,18 @@ Machine state locations (resolved at runtime):
 - `MachineAgentPath()` → `%ProgramData%\Keppin\Agent`
 - `MachineTLSPath()` → `%ProgramData%\Keppin\Agent\tls`
 
+Files in the TLS state directory:
+
+| File | Meaning |
+| --- | --- |
+| `ca-cert.der` | the CA certificate (public DER) |
+| `server-cert.der` | the **persisted** server certificate: what `LoadServingMaterial` loads |
+| `server-cert.pending.der` | a staged, validated renewal candidate; never served by `LoadServingMaterial` |
+| `server-cert.prev.der` | single-slot copy of the persisted server certificate taken before the last promotion; not a history |
+
 These persisted identities are compatibility contracts: changing them after an
-external release would create parallel identities and require migration. The
-values above are **not** affected by the module/import rename and must not be
-changed by documentation work.
+external release would create parallel identities and require migration. They
+are unchanged from v0.1.x and must not be changed by documentation work.
 
 ## Public API
 
@@ -133,6 +160,12 @@ func ReloadMachine() (Material, error)
 func LoadServingMaterial() (Material, error)
 func CleanupMachine() error
 func CleanupMachineBySHA256(fp [32]byte) error
+
+// Staged server-certificate renewal
+func StageServerRenewal() (CandidateRef, error)
+func LoadServingCandidate(ref CandidateRef) (Material, error)
+func ConfirmServingCandidate(ref CandidateRef) error
+func AbandonServingCandidate(ref CandidateRef) error
 ```
 
 `MachineAgentPath` / `MachineTLSPath` are read-only helpers exposing the
@@ -160,6 +193,50 @@ func (m *Material) Close() error
 - `CAFingerprintSHA256` is the exact SHA-256 identity of the local CA, useful for
   diagnostics and cleanup handoff.
 
+### Renewal types
+
+```go
+type RenewalOutcome int
+const (
+	RenewalNotDue RenewalOutcome = iota + 1 // the zero value is not a valid outcome
+	RenewalCandidateStaged
+)
+func (o RenewalOutcome) String() string
+
+type CandidateRef struct {
+	Outcome         RenewalOutcome
+	CandidateSHA256 [32]byte
+	BaseSHA256      [32]byte
+	CASHA256        [32]byte
+}
+```
+
+### Errors
+
+All sentinels are matched with `errors.Is`; returned errors wrap them with
+context, and a single error can match more than one sentinel.
+
+```go
+var (
+	ErrCertificateNotValidNow   error // CA or leaf expired or not yet valid
+	ErrLeafOutlivesCA           error // leaf validity would extend beyond the CA
+	ErrTrustNotHealthy          error // CA trust anchor absent or conflicting
+	ErrInconsistentMachineState error // partial or incoherent persisted state
+	ErrRenewalDue               error // run the staged renewal flow
+
+	ErrNoCandidate          error
+	ErrCandidateNotFound    error
+	ErrCandidateMismatch    error
+	ErrCandidateStale       error
+	ErrCandidatePromoted    error
+	ErrPromotionUnconfirmed error
+
+	ErrKeyNotFound            error // CNG key not found OR not accessible
+	ErrKeyDeletionUnconfirmed error // cleanup could not confirm a key deletion
+	ErrTrustAnchorNotFound    error // exact trust anchor already absent
+)
+```
+
 ### Key-store abstractions
 
 ```go
@@ -173,14 +250,15 @@ type MachineKeyDeleter interface {
 }
 func PlatformKeyStore() (MachineKeyStore, error)
 func PlatformKeyDeleter() (MachineKeyDeleter, error)
-
-var ErrKeyNotFound error
 ```
 
 `PlatformKeyStore` / `PlatformKeyDeleter` are the production platform seams the
 entry points compose through. They are not intended for consumers to swap out the
-production CNG path. `ErrKeyNotFound` is the sentinel for an absent exact
-persisted CNG key; match it with `errors.Is`.
+production CNG path. `ErrKeyNotFound` means the native open of the exact
+persisted key reported it as **not found or not accessible**: it does **not**
+prove that the key is absent, and it must never by itself trigger a reset,
+regeneration or overwrite of a key (policy). Its message keeps the native
+HRESULT.
 
 ### Trust APIs
 
@@ -213,97 +291,225 @@ type TrustStore interface {
 func PlatformTrustStore() (TrustStore, error)
 func ComputeSHA256Fingerprint(der []byte) [32]byte
 func ParseSHA256Fingerprint(hexFP string) ([32]byte, error)
-
-var ErrTrustAnchorNotFound error
 ```
 
-- Mutating operations (`TrustProvisioner`) are elevated provisioning/repair
-  concerns. Read-only verification (`TrustVerifier`) is safe for normal runtime.
+- Mutating operations (`TrustProvisioner`) are elevated concerns. Within this
+  module they are used only by first install and cleanup; no load, reload,
+  renewal or existing-state provisioning path installs trust (policy).
+  Read-only verification (`TrustVerifier`) is safe for normal runtime.
 - `TrustStore` is a backward-compatibility combined interface; `EnsureTrusted` is
   **deprecated**. New code should use `TrustProvisioner` and `TrustVerifier`
   separately.
 - `ComputeSHA256Fingerprint` returns the SHA-256 identity of a DER certificate.
 - `ParseSHA256Fingerprint` parses a 64-hex-character fingerprint (surrounding
   whitespace tolerated, case-insensitive) into a `[32]byte`.
-- `ErrTrustAnchorNotFound` is the sentinel for an absent exact trust anchor; match
-  it with `errors.Is`.
 
-### Legacy / testing APIs
+### Lower-level seam and testing APIs
 
 ```go
-type Protector interface {
-	Protect(plaintext []byte) ([]byte, error)
-	Unprotect(ciphertext []byte) ([]byte, error)
-}
-func PlatformProtector() (Protector, error) // returns an error (not configured)
-
-func Provision(dataDir string, protector Protector, trustStore TrustStore, now func() time.Time) (Material, error)
 func ProvisionWithKeyStore(dataDir string, keyStore MachineKeyStore, trustStore TrustStore, now func() time.Time) (Material, error)
 ```
 
-- `Provision` is the legacy **Protector-based** path, kept for backwards-compatible
-  tests that use exported private keys. It persists protected private-key material
-  and is **not** the production flow. Do not teach it as the normal production
-  path.
-- `ProvisionWithKeyStore` is the key-store-based provisioning seam (also used by
-  `ProvisionMachine`). It is exported but is a lower-level seam, not the preferred
-  consumer entry point.
-- `PlatformProtector` currently returns an error: the production machine path uses
-  CNG/KSP key custody rather than the protector-based path, so machine key
-  protection is not configured.
+- `ProvisionWithKeyStore` is the key-store-based provisioning seam used by
+  `ProvisionMachine`. It is exported but is a lower-level seam, not the preferred
+  consumer entry point: it does **not** perform the first-install pre-check or
+  privilege check that `ProvisionMachine` adds, and the single-writer contract
+  applies to it as well.
 
 The package also exports Windows-only test/smoke helpers (`TestCreateKey`,
 `TestOpenKey`, `TestDeleteKey`, `TestSignAndVerify`, `ProvisionSmoke`,
 `CleanupSmoke`, `VerifySmokeTrust`, `CleanupSmokeAnchorBySHA256`,
 `SmokeCAKeyName`, `SmokeServerKeyName`) scoped to the `Keppin.Test.*` namespace.
-These are testing surfaces, not production APIs.
+These are testing surfaces, not production APIs; see
+[Smoke helpers](#smoke-helpers).
 
 ## Provisioning flow
 
-`ProvisionMachine()` (Windows-only, elevated) performs first install or repair:
+`ProvisionMachine()` (Windows-only, elevated) performs **first install** or
+**read-only verification of existing state**. It never repairs.
 
-1. resolves `MachineAgentPath()`;
-2. **fails closed** on any partial or incoherent pre-existing state — one
-   certificate DER present without the other, a persisted key with no certificate
-   material, or certificate material whose persisted keys are missing or
-   unopenable — rather than silently regenerating a CA or creating replacement
-   keys (policy; guarded by `checkInconsistentMachineState`, which is open-only);
-3. creates or opens the persisted CA and server CNG keys;
-4. creates and persists public CA and server certificate DER only (production
-   machine path);
-5. installs the exact local CA into `LocalMachine\Root` (idempotent);
-6. preserves the existing CA identity across repeated healthy provisioning, and
-   renews the server certificate only when required, reusing the existing
-   persisted server key.
+**First install** is entered only when neither certificate DER is present. A
+conservative pre-check runs first and fails closed (policy) when:
+
+- the server DER exists without the CA DER;
+- the CA key opens although the CA DER is missing;
+- the CA key open fails with any error other than `ErrKeyNotFound`;
+- the caller is not LocalSystem or an elevated Administrator, or its privilege
+  cannot be determined;
+- the presence of a DER cannot be determined (for example access denied).
+
+It then:
+
+1. creates or opens the persisted CA and server CNG keys;
+2. creates and persists public CA and server certificate DER only;
+3. installs the exact local CA into `LocalMachine\Root` (idempotent).
+
+The first-install server certificate becomes the persisted certificate without
+consumer confirmation, because no previous certificate or consumer exists yet.
+
+**Existing, complete state** is verified with the common validator (keys,
+issuer, SANs, EKU, CA and leaf validity, leaf not outliving the CA, chain,
+`TrustHealthy`). It **writes no DER, installs no trust and does not renew**
+(policy). Success means "the existing state was verified", not "the certificate
+was renewed": a still-valid leaf inside `RenewalThreshold` is returned with a
+`nil` error; an expired leaf fails with `ErrRenewalDue` and
+`ErrCertificateNotValidNow`.
+
+- **No trust repair.** A `TrustAbsent` or `TrustConflict` anchor fails closed
+  with `ErrTrustNotHealthy`; re-running `ProvisionMachine` does not reinstall a
+  missing anchor (policy; verified). See
+  [Trust states and recovery](#trust-states-and-recovery).
+- **No partial-state repair.** Exactly one certificate DER present, or a DER
+  whose presence cannot be determined, fails closed with
+  `ErrInconsistentMachineState`. The CA certificate is never reissued for
+  existing state, and keys are never regenerated (policy; verified).
+- **Key acquisition on existing state.** Existing-state verification still
+  acquires keys through the `MachineKeyStore` open-or-create seam, so "writes no
+  DER" does not mean "never creates a key": a missing key name can be created as
+  a side effect, after which verification fails on the key mismatch. The runtime
+  and renewal paths open existing keys only.
+
+**First-install limits (residual risk, accepted under the single-writer
+contract):** the pre-check is a conservative gate, not proof that the CA key is
+absent — `ErrKeyNotFound` means "not found or not accessible" even for
+LocalSystem and Administrators. The check and the later open-or-create are not
+atomic, so there is no guarantee that the CA key certified on first install was
+created by that call. A first install interrupted after the DER writes but
+before trust installation leaves complete DER with `TrustAbsent`, which a later
+`ProvisionMachine` does not repair.
 
 `LoadServingMaterial()` is the preferred serving-startup path:
 
-- loads CA and server public DER;
+- loads CA and server public DER (never a staged candidate);
 - opens **only the server CNG key** (never the CA key);
-- verifies server cert ↔ server key, issuer, and SANs;
-- performs read-only trust verification and fails closed unless the CA is
-  `TrustHealthy`;
-- does **not** renew the server certificate and does not check its expiry — use
-  `ReloadMachine` for the maintenance/renewal path;
-- does not mutate `LocalMachine\Root`.
+- verifies server cert ↔ server key, issuer, SANs and server-auth EKU;
+- verifies CA and server validity **now**, that the server certificate does not
+  outlive the CA, and chain verification to the CA — an expired certificate fails
+  closed with `ErrCertificateNotValidNow`;
+- performs read-only trust verification and fails closed with
+  `ErrTrustNotHealthy` unless the CA is `TrustHealthy`;
+- never renews, never writes, and never mutates `LocalMachine\Root`.
 
-`ReloadMachine()` is the broader maintenance/reload path:
+`ReloadMachine()` is the full-state verification path:
 
-- opens **both** the CA and server keys;
-- verifies cert/key/issuer/SAN/trust state;
-- does not mutate `LocalMachine\Root`;
-- may renew the server certificate when near/past expiry (reusing the persisted
-  server key).
+- opens **both** the CA and server keys (open-only, never creates);
+- applies the same certificate, validity and trust checks;
+- never writes and never mutates `LocalMachine\Root`;
+- does **not** renew: when the server certificate is within `RenewalThreshold`
+  of expiry (or expired) it releases every handle and returns `ErrRenewalDue`
+  (an expired certificate also matches `ErrCertificateNotValidNow`). CA, key,
+  identity and trust failures detected first are returned with their own errors.
 
 ### Decision guide
 
 | Need | Preferred API | Elevation / mutation |
 | --- | --- | --- |
-| First install / repair | `ProvisionMachine()` | Administrator; may create keys, write DER, install trust |
-| Normal serving startup | `LoadServingMaterial()` | No trust mutation; opens server key only |
-| Reload + possible renewal | `ReloadMachine()` | No trust mutation; opens CA + server keys; may rewrite server DER |
+| First install | `ProvisionMachine()` | Administrator; creates keys, writes DER, installs trust |
+| Verify existing state (installer) | `ProvisionMachine()` | Administrator; writes nothing; never repairs trust or renews |
+| Normal serving startup | `LoadServingMaterial()` | No trust mutation; opens server key only; never writes |
+| Full-state verification | `ReloadMachine()` | No trust mutation; opens CA + server keys; never writes; reports `ErrRenewalDue` |
+| Server-certificate renewal | `StageServerRenewal()` → `LoadServingCandidate(ref)` → consumer activation/attestation → `ConfirmServingCandidate(ref)` or `AbandonServingCandidate(ref)` | No trust mutation; opens existing keys only; writes public DER only |
 | Exact cleanup (DER available) | `CleanupMachine()` | Administrator; destructive |
 | Cleanup by fingerprint | `CleanupMachineBySHA256(fp)` | Administrator; destructive |
+
+## Server-certificate renewal
+
+Renewal keeps the CA key, the server key, the CA certificate and the trust
+anchor unchanged. Only a new public leaf is issued, and the persisted
+certificate is replaced only when the consumer requests it.
+
+| # | Event | Owner | API |
+| --- | --- | --- | --- |
+| 1 | Stage a validated candidate | Local TLS | `StageServerRenewal()` |
+| 2 | Load exactly that candidate | Local TLS | `LoadServingCandidate(ref)` |
+| 3 | Activate it in the listener | consumer | consumer code |
+| 4 | Attest that the listener serves it | consumer | consumer code |
+| 5 | Promote it to the persisted certificate | Local TLS, on request | `ConfirmServingCandidate(ref)` |
+| — | Discard the candidate | consumer request | `AbandonServingCandidate(ref)` |
+
+- `StageServerRenewal` verifies the CA (validity, key match, `TrustHealthy`) and
+  the identity of the persisted leaf; an expired previous leaf is accepted as the
+  renewal base. It returns `RenewalNotDue` (nothing written) or
+  `RenewalCandidateStaged`. It reuses a pending candidate only if it is valid now
+  and advances the persisted certificate, and otherwise replaces it. It opens
+  existing keys only, never installs trust, and never rotates keys or the CA.
+- `CandidateRef` carries the candidate, base and CA SHA-256 digests. It is public
+  metadata only: **not** a secret, an authorization, a compare-and-swap token, or
+  proof of activation. Keep it for the whole attempt; if it is lost, restart the
+  attempt. The presence of a pending file never means "confirmed".
+- `LoadServingCandidate` reverifies the CA and base digests and that the pending
+  file is exactly `ref`'s candidate, applies the same checks as
+  `LoadServingMaterial`, opens only the server key and never writes. Loading is
+  **not** activation; the caller owns and must `Close` the returned `Material`.
+- **Activation and attestation belong to the consumer** (caller responsibility).
+  A suitable attestation is a fresh, full (non-resumed) handshake to the intended
+  endpoint, verifying chain and name against the local CA and comparing the
+  SHA-256 of the observed peer leaf with `ref.CandidateSHA256`. Keep the previous
+  `Material` open until rollback is no longer possible.
+- `ConfirmServingCandidate` is a **promotion request** after the consumer's own
+  attestation, not proof of it: Local TLS cannot observe the listener. It
+  revalidates CA, trust, candidate and digests, writes `server-cert.prev.der` as
+  a copy of the current persisted certificate, then replaces `server-cert.der`
+  with the candidate in one same-directory rename.
+- `AbandonServingCandidate` deletes the pending file only when it is `ref`'s
+  candidate. It is an idempotent no-op when nothing is pending (not proof of a
+  rollback), returns `ErrCandidateMismatch` when a different candidate is pending
+  and `ErrCandidatePromoted` when the candidate is already persisted. It never
+  reverses a listener activation or a completed promotion.
+
+Consumer rollback before promotion: restore the previous `Material` in the
+listener, verify the restore, then call `AbandonServingCandidate`.
+
+Retry and reconciliation (under the single-writer contract):
+
+| State found by `ConfirmServingCandidate(ref)` | Result |
+| --- | --- |
+| persisted = base, pending = candidate | back up, then promote |
+| persisted = candidate (completed, e.g. lost response) | revalidate; `nil` only while the promoted certificate still validates and no different pending exists; the backup is never rewritten |
+| persisted = candidate, a different pending present | `ErrCandidateMismatch`; nothing touched |
+| persisted ≠ base and ≠ candidate, or CA changed | `ErrCandidateStale`; nothing touched |
+| pending missing / different | `ErrCandidateNotFound` / `ErrCandidateMismatch`; nothing touched |
+| final rename reports an error | `ErrPromotionUnconfirmed`: the outcome is **unknown**, never "not promoted"; retry with the same `ref` |
+
+**Post-promotion recovery is administrative**, not automatic: there is no
+rollback API and no automatic fallback to the pending or backup file. Under the
+single-writer contract, an administrator may revalidate `server-cert.prev.der`
+(for example by restoring it and running `LoadServingMaterial`) and restore it
+by writing a temporary file in the same directory and renaming it over
+`server-cert.der`. If the backed-up predecessor has expired it cannot be served.
+A missing or corrupt `server-cert.der` fails closed; nothing is regenerated.
+
+### Writes, interruption and power loss
+
+- **Write discipline (policy).** Every DER write goes through a temporary file in
+  the same directory (reserved prefix `.localtls-tmp-`) that is written (a short
+  write is an error), flushed and closed, then renamed with a single
+  `MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)`. Copy fallback
+  is not allowed and the target is never deleted first. An error reported by the
+  rename itself may come after it took effect; the caller reconciles. Orphan
+  temporaries with the reserved prefix are removed only by `StageServerRenewal`.
+  These paths are exercised by offline fault-injection and retry tests; there is
+  no process-kill or power-cut test.
+- **What is guaranteed after an interruption.** On a new load, bytes that fail
+  DER, key, signature, SAN, EKU, time, chain or trust validation are rejected
+  (policy; verified). That is the whole guarantee: older, authentic material that
+  is still valid can pass validation.
+- **What is not guaranteed.** Local TLS does **not** promise that the last
+  confirmed promotion survives, monotonicity or anti-rollback, recoverability of
+  the backup file, or availability after a sudden power loss. Durability across
+  power loss depends on the filesystem, drivers and storage honouring flushes and
+  write-through, and the backup-then-promote sequence is not one atomic
+  transaction.
+- **Assumptions.** The persisted keys and the trust anchor are retained, the
+  system clock is correct, and the TLS directory, its temporaries and the
+  pending/backup files are on one local NTFS volume in the same directory.
+- **Sharing.** A reader that holds `server-cert.der` open can block the rename;
+  `ConfirmServingCandidate` then returns `ErrPromotionUnconfirmed`. Retry with the
+  same `ref`.
+
+Local TLS does not ship a listener integration. The renewal protocol is exercised
+in this repository's tests offline, with a fake in-memory consumer and an
+in-memory TLS handshake.
 
 ## Certificate & key lifecycle
 
@@ -316,26 +522,37 @@ Verified properties of the generated material:
 - Server certificate is signed by that CA; server-auth EKU only.
 - Server identity is strictly local: DNS SAN `localhost`; IP SANs `127.0.0.1`
   and `::1` (validated by `validateSAN`).
-- CA validity is **5 years**; server validity is **90 days**; renewal triggers
-  when the server certificate is within `RenewalThreshold` (**30 days**) of
-  expiry or already expired.
+- CA validity is 5 × 365 days and server validity is 90 days, each starting
+  5 minutes before issuance. Renewal is due when the server certificate is within
+  `RenewalThreshold` (**30 days**) of expiry or already expired.
 - Renewal **reuses** the existing persisted server key — key rotation is
-  decoupled from certificate renewal (verified by
-  `TestRenewalViaKeyStorePreservesCAAndServerKey`).
+  decoupled from certificate renewal (verified).
 - The CA `MaxPathLen=0` constraint rejects subordinate-CA chains (verified by
   `TestSubordinateCAChainRejected`).
 
-Key custody differs between the two provisioning paths:
+Validity rules (policy; verified):
 
-- **Production machine (CNG) path** (`ProvisionMachine`, `LoadServingMaterial`,
-  `ReloadMachine`): the module never receives private-key bytes — it operates on
-  `crypto.Signer` handles only, and persists only the public certificate DER
-  (`ca-cert.der`, `server-cert.der`) (policy; verified by construction).
-- **Legacy Protector path** (`Provision`): persists serialized private-key
-  material through a `Protector` seam (`ca-key.enc`, `server-key.enc`) alongside
-  the public DER. This is not the production flow. `Protector` is a seam — this
-  repository does not guarantee that a given implementation actually encrypts the
-  bytes it receives.
+- **Inclusive validity.** A CA or server certificate is valid at exactly its
+  encoded `NotBefore` and exactly its encoded `NotAfter` instant, consistent with
+  Go `crypto/x509`; one nanosecond outside either bound is invalid
+  (`ErrCertificateNotValidNow`).
+- **Leaf never outlives the CA.** A server certificate whose `NotAfter` is after
+  the CA's `NotAfter` is rejected with `ErrLeafOutlivesCA`. Local TLS never
+  shortens ("caps") a leaf to fit and never renews or rotates the CA
+  automatically.
+- **Conservative staging fit.** `StageServerRenewal` refuses with
+  `ErrLeafOutlivesCA` when `now + 90 days` is after the CA's `NotAfter`. This is
+  checked on the requested validity before encoding, so it is stricter than the
+  validation rule above (a sub-second difference that encoding would round away
+  is still refused). Consequence: during roughly the last 90 days of the CA's
+  life no renewal can be staged; replacing the CA requires cleanup and fresh
+  provisioning, which creates a new CA fingerprint.
+
+Key custody:
+
+- The module never receives private-key bytes — it operates on `crypto.Signer`
+  handles only, and persists only the public certificate DER (policy; verified by
+  construction).
 - Non-exportable, machine-scoped, persistent keys are provided by
   `github.com/keppin-oss/cng` (assumed — enforced by the CNG layer, not
   re-verified here).
@@ -349,7 +566,8 @@ The Windows trust adapter targets `LocalMachine\Root`:
 - `RemoveTrust` / `RemoveTrustBySHA256` remove by exact identity; removal is by
   exact SHA-256 only, never by subject/CN, wildcard, or prefix (policy).
 - `VerifyTrust` is read-only and returns:
-  - `TrustHealthy` — exact CA present;
+  - `TrustHealthy` — exact CA present (other same-subject anchors are not
+    examined in that case);
   - `TrustConflict` — same-subject certificate with a different fingerprint
     (manual resolution required; never auto-remove);
   - `TrustAbsent` — CA not present;
@@ -360,6 +578,38 @@ Trust verification uses exact CA identity, not loose subject-name trust. A
 conflicting certificate (same CN, different fingerprint) is reported as
 `TrustConflict` (verified).
 
+### Trust states and recovery
+
+Every load, reload, renewal and existing-state provisioning path requires
+`TrustHealthy` and otherwise fails closed with `ErrTrustNotHealthy`. None of
+them installs or repairs trust (policy; verified).
+
+| State | Response |
+| --- | --- |
+| `TrustHealthy` | none |
+| `TrustAbsent` | fails closed everywhere; **no automatic or API-based repair** (see below) |
+| `TrustConflict` | manual resolution required; never auto-remove the conflicting anchor |
+| `TrustError` | inspect trust-store access; retry the read-only verification |
+
+No provisioning call repairs trust. Match `ErrTrustNotHealthy` with `errors.Is`
+and do not rely on the message text.
+
+Recovering from `TrustAbsent` on otherwise complete state is an operator
+decision outside the Local TLS API. Neither option below is automatic, and
+neither is guaranteed to restore service:
+
+- **Operator-managed import of the exact persisted CA.** An operator may import
+  the exact persisted `ca-cert.der` into `LocalMachine\Root` with their own
+  tooling. Local TLS does not perform, support or validate this import; it only
+  verifies the resulting trust state on the next load, by exact fingerprint.
+  Importing any other certificate does not make the state `TrustHealthy`.
+- **Cleanup and fresh provisioning.** `CleanupMachine` followed by a new
+  `ProvisionMachine` first install creates a **new CA key and a new CA
+  fingerprint**. Consumers that pin or distributed the old CA certificate or
+  fingerprint stop trusting the new material. A fresh first install happens only
+  after a cleanup that returned `nil`; while cleanup retains the state directory
+  (see below), `ProvisionMachine` keeps failing closed.
+
 ## Cleanup behavior
 
 `CleanupMachine()` and `CleanupMachineBySHA256(fp)` remove, in order, on a
@@ -368,33 +618,78 @@ best-effort basis across independently removable artifacts:
 1. the exact local CA trust anchor from `LocalMachine\Root`;
 2. the exact local CA CNG key;
 3. the exact local server CNG key;
-4. the Local TLS state directory (`...\Agent\tls`).
+4. the Local TLS state directory (`...\Agent\tls`), including the pending and
+   backup files.
 
 Failure semantics:
 
 - a failure on one artifact does not stop removal of the others (best-effort);
 - failures not attributable to "already absent" are aggregated with `errors.Join`
   so no security-sensitive artifact failure is silently swallowed (verified);
-- already-absent exact artifacts are idempotent success via `ErrKeyNotFound` and
-  `ErrTrustAnchorNotFound`;
+- an already-absent trust anchor (`ErrTrustAnchorNotFound`) or state directory
+  is idempotent success;
+- a key delete that reports `ErrKeyNotFound` (not found **or not accessible**)
+  is **not** a confirmed deletion: it is returned as `ErrKeyDeletionUnconfirmed`
+  (which also matches `ErrKeyNotFound`), and the state directory, including the
+  CA DER, is then retained for diagnosis and a retried cleanup (verified).
+  Cleanup returns `nil` only when both key deletions were confirmed, so a
+  repeated cleanup reports an unconfirmed deletion;
 - cleanup never deletes by subject/CN, wildcard, prefix, or unrelated parent
   directory.
 
 `CleanupMachine` needs the on-disk CA DER to identify the trust anchor. If the
 state directory (and thus the DER) is already gone, use
-`CleanupMachineBySHA256` with the known fingerprint.
+`CleanupMachineBySHA256` with the known fingerprint. Cleanup removes only the
+anchor identified by that DER or fingerprint; it does not search for other
+historical anchors.
+
+### Smoke helpers
+
+`ProvisionSmoke` and `CleanupSmoke` operate on a caller-chosen test root and the
+`Keppin.Test.Smoke.*` key names only; they require Administrator elevation.
+`CleanupSmoke` follows the same contract as production cleanup:
+
+- **An error does not mean nothing was cleaned up.** When both smoke key
+  deletions are confirmed, removal of the smoke root is attempted even if
+  trust-anchor removal failed; the trust error is still returned with the root
+  (and its CA DER) gone. Preserve the exact CA DER or its fingerprint outside the
+  smoke root if trust removal may need a retry; the fingerprint works with
+  `CleanupSmokeAnchorBySHA256`.
+- **A retry may never return nil.** An ambiguous `ErrKeyNotFound` keeps
+  producing `ErrKeyDeletionUnconfirmed` and the root is retained; do not treat
+  that as a confirmed deletion.
+
+## Error semantics
+
+- When provisioning, loading or reloading fails, the returned `Material` is zero
+  and every handle the module opened has been released.
+- `ProvisionMachine` returns `ErrInconsistentMachineState` for partial or
+  incoherent state. When complete DER exists but a persisted key cannot be
+  opened, the error **also** matches `ErrKeyNotFound` (several causes may be
+  joined). Check `ErrInconsistentMachineState` first, and never treat a nested
+  `ErrKeyNotFound` as permission to initialize, reset or delete anything
+  (caller responsibility).
+- `ErrRenewalDue`: `ReloadMachine` reports it as soon as the leaf is within
+  `RenewalThreshold` of expiry; existing-state provisioning reports it only once
+  the leaf has expired. Run the staged renewal flow.
+- `ErrCertificateNotValidNow`, `ErrLeafOutlivesCA` and `ErrTrustNotHealthy` are
+  fail-closed results of the common validator.
+- Renewal sentinels (`ErrNoCandidate`, `ErrCandidateNotFound`,
+  `ErrCandidateMismatch`, `ErrCandidateStale`, `ErrCandidatePromoted`,
+  `ErrPromotionUnconfirmed`) are described in
+  [Server-certificate renewal](#server-certificate-renewal).
+- In cleanup only `ErrTrustAnchorNotFound` is idempotent success;
+  `ErrKeyNotFound` is reported as `ErrKeyDeletionUnconfirmed`.
 
 ## Security model
 
-- On the production machine path, private keys are machine-scoped and never
-  persisted as files; the module never handles private-key bytes on that path.
-  (The legacy Protector path is the exception: it persists private-key material
-  through the `Protector` seam.)
+- Private keys are machine-scoped CNG keys and never persisted as files; the
+  module never handles private-key bytes.
 - The CA is a path-length-zero, sign-only CA used exclusively to issue the local
   `localhost` server certificate.
 - Trust is anchored on exact SHA-256 identity, not subject name.
-- Missing or conflicting trust, cert/key mismatch, unexpected issuer, and invalid
-  SAN all fail closed.
+- Missing or conflicting trust, cert/key mismatch, unexpected issuer, invalid
+  SAN or EKU, invalid validity, and a leaf outliving the CA all fail closed.
 - **No example or consumer guidance may set `InsecureSkipVerify`, disable
   hostname verification, ignore trust state, or bypass the module's verification
   policy** (policy).
@@ -420,9 +715,12 @@ state directory (and thus the DER) is already gone, use
 - Production machine functions are Windows-only (`//go:build windows`).
 - On non-Windows (`//go:build !windows`), the machine functions
   (`MachineAgentPath`, `MachineTLSPath`, `ProvisionMachine`, `ReloadMachine`,
-  `LoadServingMaterial`, `CleanupMachine`, `CleanupMachineBySHA256`) and the
-  platform seams (`PlatformKeyStore`, `PlatformKeyDeleter`,
-  `PlatformTrustStore`) return explicit unsupported-platform errors.
+  `LoadServingMaterial`, `StageServerRenewal`, `LoadServingCandidate`,
+  `ConfirmServingCandidate`, `AbandonServingCandidate`, `CleanupMachine`,
+  `CleanupMachineBySHA256`) and the platform seams (`PlatformKeyStore`,
+  `PlatformKeyDeleter`, `PlatformTrustStore`) return explicit
+  unsupported-platform errors. The smoke and test-key helpers exist only on
+  Windows.
 - The `localtls` package itself remains buildable/testable on non-Windows via
   stubs; only the production machine functions are Windows-only. The Windows-only
   commands (`cmd/verify`, `examples/provision`, `examples/serving`) carry
@@ -435,17 +733,17 @@ state directory (and thus the DER) is already gone, use
   never mutates trust; never opens the CA key; no `InsecureSkipVerify`.
   Windows-only.
 - [`examples/provision`](../examples/provision/main.go) — elevated
-  `ProvisionMachine()` and inspection of the returned public metadata. Mutates
-  machine CNG state and `LocalMachine\Root`; must not run in normal tests.
-  Windows-only.
+  `ProvisionMachine()` (first install or existing-state verification; no renewal
+  or trust repair) and inspection of the returned public metadata. Mutates
+  machine CNG state and `LocalMachine\Root` on first install; must not run in
+  normal tests. Windows-only.
 - [`examples/fingerprint`](../examples/fingerprint/main.go) — non-destructive
   demonstration of `ComputeSHA256Fingerprint`, `ParseSHA256Fingerprint`, and the
   `CleanupMachine` vs `CleanupMachineBySHA256` handoff decision. Cross-platform.
 
 ## Validation
 
-Default validation path (cross-platform; Windows-specific tests run only on
-Windows and skip when not elevated):
+Default validation path:
 
 ```text
 go build ./...
@@ -453,25 +751,43 @@ go vet ./...
 go test ./...
 ```
 
-Elevated Windows validation for the CNG / trust-store / cleanup lifecycle is
-provided by Windows-specific tests that skip when not running as Administrator:
+On non-Windows, the Windows-specific tests are excluded by build tags. On
+Windows, the elevated lifecycle test `TestCleanupLifecycleElevated` skips when
+not running as Administrator, but the trust-store tests
+`TestTrustStoreInstallAndVerify`, `TestTrustStoreConflictingCert` and
+`TestRemoveNonExistent` use `LocalMachine\Root` directly and are not
+elevation-gated. On a machine whose trust store must not be touched, skip them:
 
 ```text
-go test -v ./... -run 'TestCleanupLifecycleElevated|TestTrustStore'
+go test ./... -skip '^(TestTrustStoreInstallAndVerify|TestTrustStoreConflictingCert|TestRemoveNonExistent|TestCleanupLifecycleElevated)$'
 ```
 
-Live flows requiring elevation, machine CNG state, and `LocalMachine\Root`
-mutation are reported **NOT EXECUTED** in unprivileged environments and must be
-validated manually on a disposable Windows environment.
+Elevated Windows validation for the CNG / trust-store / cleanup lifecycle runs
+from an elevated shell on a disposable Windows environment:
+
+```text
+go test -v ./... -run 'TestCleanupLifecycleElevated|TestTrustStore|TestRemoveNonExistent'
+```
+
+The renewal protocol, its fault injection and retries, and a fake consumer with
+an in-memory TLS handshake run offline and unprivileged with `go test`. Live
+flows requiring elevation, machine CNG state, and `LocalMachine\Root` mutation
+are reported **NOT EXECUTED** in unprivileged environments and must be validated
+manually on a disposable Windows environment.
 
 ## Limitations
 
 - **Windows-only** for production machine flows.
 - **Microsoft Software KSP only** — no other key provider is supported.
-- The legacy Protector path is **not** the production path; `PlatformProtector`
-  returns an error because machine key protection is not configured.
+- **No trust repair** — a missing trust anchor on existing state is never
+  reinstalled by the module.
+- **No CA renewal or rotation** — replacing the CA means cleanup and fresh
+  provisioning with a new fingerprint.
+- **No listener integration** — activation and attestation of a renewed
+  certificate are consumer code.
 - Trust-conflict resolution is **manual** — the module never auto-removes a
   conflicting anchor.
+- The single-writer contract is not enforced by the module.
 - The module does not provide a generic TLS/PKI or trust-store framework.
 
 ## Troubleshooting
@@ -483,7 +799,71 @@ validated manually on a disposable Windows environment.
 3. **Elevation** — provisioning and cleanup require Administrator; serving
    startup and read-only verification do not, but the process must be able to
    open the persisted server key.
-4. **Trust** — `TrustAbsent` / `TrustConflict` fails closed; do not weaken trust
+4. **Trust** — `TrustAbsent` / `TrustConflict` fails closed with
+   `ErrTrustNotHealthy`; re-running `ProvisionMachine` does not repair it. See
+   [Trust states and recovery](#trust-states-and-recovery). Do not weaken trust
    checks and do not auto-remove a conflicting anchor.
-5. **Sentinels** — match with `errors.Is(err, localtls.ErrKeyNotFound)` /
-   `errors.Is(err, localtls.ErrTrustAnchorNotFound)`.
+5. **Inconsistent state** — `ErrInconsistentMachineState` is never resolved
+   automatically; inspect the state directory and keys before any cleanup.
+6. **Renewal** — `ErrRenewalDue` means "run the staged renewal flow". A
+   successful `ProvisionMachine` does not mean the certificate was renewed. An
+   expired certificate fails closed in `LoadServingMaterial` until a candidate is
+   staged, activated, attested and confirmed.
+7. **Sentinels** — match with `errors.Is`, never on message text.
+
+## Upgrading from v0.1.x
+
+v0.2.0 is a breaking release. The persisted identities (key names, directory and
+file names) are unchanged, so v0.2.0 reads machine state written by v0.1.x, but
+several behaviors change on purpose. This repository does not include a test
+that upgrades live v0.1.x machine state.
+
+### Reliability notice for v0.1.x
+
+v0.1.x has lifecycle behaviors that v0.2.0 replaces because they can leave a
+machine in a state that is hard to diagnose or recover: in-place server
+certificate renewal without consumer confirmation, cleanup that treated an
+ambiguous "key not found or not accessible" result as a successful deletion,
+re-issuing a CA certificate for partial state through the `ProvisionWithKeyStore`
+seam, and silently shortening a leaf near CA expiry. This is a reliability and
+migration notice; no exploitation or security incident is claimed. Users of
+v0.1.x should plan the migration below.
+
+### Behavior changes
+
+| Area | v0.1.x | v0.2.0 |
+| --- | --- | --- |
+| `ProvisionMachine` on existing state with `TrustAbsent` | reinstalled the persisted CA into `LocalMachine\Root` | **fails closed** with `ErrTrustNotHealthy`; installs nothing, regenerates nothing, writes no DER, does not renew |
+| `ProvisionMachine` on existing state, renewal window | renewed the server certificate in place | verifies only; returns a still-valid leaf with `nil`, an expired leaf with `ErrRenewalDue` |
+| `ReloadMachine` | renewed the server certificate in place when due | never writes; returns `ErrRenewalDue` |
+| Renewal | implicit, in place | explicit `StageServerRenewal` → `LoadServingCandidate` → consumer activation/attestation → `ConfirmServingCandidate` / `AbandonServingCandidate` |
+| `LoadServingMaterial` | did not check expiry | fails closed on an expired or not-yet-valid certificate and on a leaf outliving the CA |
+| Leaf near CA expiry | `NotAfter` capped at the CA's `NotAfter` | rejected with `ErrLeafOutlivesCA`; no capping |
+| Validity boundary | CA treated as expired at exactly `NotAfter` | inclusive at `NotBefore` and `NotAfter` for CA and leaf |
+| Partial state via `ProvisionWithKeyStore` | could re-issue a CA certificate when the CA DER was missing | fails closed with `ErrInconsistentMachineState` |
+| Cleanup and `CleanupSmoke` on `ErrKeyNotFound` | idempotent success; smoke root always removed | `ErrKeyDeletionUnconfirmed`; state directory / smoke root retained |
+| `ErrKeyNotFound` | "key not found" | "not found or not accessible"; never proof of absence |
+| Legacy API | `Provision`, `Protector`, `PlatformProtector` exported | removed |
+| CNG dependency | `github.com/keppin-oss/cng v0.1.2` | `v0.2.0` |
+
+### Migration steps
+
+- **Callers relying on implicit renewal** (`ReloadMachine` or re-running
+  `ProvisionMachine`) compile unchanged but must handle `ErrRenewalDue` and
+  implement the staged renewal flow, including activation and attestation in
+  their listener.
+- **Callers relying on trust repair** by re-running `ProvisionMachine` must
+  handle `ErrTrustNotHealthy` as an operator decision; see
+  [Trust states and recovery](#trust-states-and-recovery). Plan for the CA
+  fingerprint change if cleanup and fresh provisioning are chosen.
+- **Callers of `Provision` / `Protector`** must move to the machine/CNG entry
+  points. There is no migration of previously exported legacy keys into CNG;
+  such material must be retired and provisioned fresh.
+- **Cleanup callers** must treat `ErrKeyDeletionUnconfirmed` as "not confirmed",
+  keep the retained state for diagnosis, and must not expect a repeated cleanup
+  to return `nil`.
+- **Error handling** must use `errors.Is` with the sentinels above, giving
+  `ErrInconsistentMachineState` precedence over a nested `ErrKeyNotFound`.
+- **CA lifetime planning** — since the leaf is never capped and the CA is never
+  renewed automatically, plan CA replacement (cleanup and fresh provisioning)
+  before the last 90 days of the CA's validity.

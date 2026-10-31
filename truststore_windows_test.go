@@ -9,9 +9,13 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"math/big"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/keppin-oss/local-tls/internal/identity"
 	"golang.org/x/sys/windows"
@@ -309,12 +313,14 @@ func TestCertDERHashStability(t *testing.T) {
 	}
 }
 
-// TestDeleteCertificateFromStoreOwnership exercises the removal path's
-// ownership contract on an in-memory store (no LocalMachine\Root mutation, no
-// elevation): CertDeleteCertificateFromStore already frees the found
-// CERT_CONTEXT, so the removal helper must free the context exactly once and
-// the certificate must be gone from the store afterward. This locks the fix that
-// removed the redundant CertFreeCertificateContext after CertDeleteCertificateFromStore.
+// TestDeleteCertificateFromStoreOwnership exercises the removal ownership
+// contract on an in-memory store (no LocalMachine\Root mutation, no
+// elevation): the context found by findCertBySHA256 is handed to
+// deleteCertificateFromStore, which frees it, and the certificate is gone from
+// the store afterward. A separately duplicated reference held by the test is
+// unaffected by the delete and is released by the test exactly once. This
+// does not detect a double free by itself; TestRemoveTrustPathsDoNotFreeAfterDelete
+// locks the call structure of the removal paths.
 func TestDeleteCertificateFromStoreOwnership(t *testing.T) {
 	store, err := windows.CertOpenStore(windows.CERT_STORE_PROV_MEMORY, 0, 0, 0, 0)
 	if err != nil {
@@ -325,11 +331,7 @@ func TestDeleteCertificateFromStoreOwnership(t *testing.T) {
 	cert := generateTestCACert(t)
 	fp := sha256.Sum256(cert.Raw)
 
-	certCtx, err := windows.CertCreateCertificateContext(
-		x509AsnEncoding|pkcs7AsnEncoding,
-		&cert.Raw[0],
-		uint32(len(cert.Raw)),
-	)
+	certCtx, err := windows.CertCreateCertificateContext(x509AsnEncoding|pkcs7AsnEncoding, &cert.Raw[0], uint32(len(cert.Raw)))
 	if err != nil {
 		t.Fatalf("CertCreateCertificateContext: %v", err)
 	}
@@ -337,10 +339,9 @@ func TestDeleteCertificateFromStoreOwnership(t *testing.T) {
 		windows.CertFreeCertificateContext(certCtx)
 		t.Fatalf("CertAddCertificateContextToStore: %v", err)
 	}
-	// The caller's reference is no longer needed; the store keeps its own copy.
+	// The store keeps its own copy; the creation reference is released here.
 	windows.CertFreeCertificateContext(certCtx)
 
-	// Find the exact context through the same helper the removal paths use.
 	existing, err := findCertBySHA256(store, fp)
 	if err != nil {
 		t.Fatalf("findCertBySHA256: %v", err)
@@ -348,14 +349,20 @@ func TestDeleteCertificateFromStoreOwnership(t *testing.T) {
 	if existing == nil {
 		t.Fatal("certificate not found in memory store")
 	}
+	held := windows.CertDuplicateCertificateContext(existing)
+	if held == nil {
+		t.Fatal("CertDuplicateCertificateContext returned nil")
+	}
+	defer windows.CertFreeCertificateContext(held)
 
-	// The removal helper takes ownership of the context and frees it (via
-	// CertDeleteCertificateFromStore); the caller must not free it again.
+	// Ownership of existing passes to the delete; it is not used or freed again.
 	if err := deleteCertificateFromStore(existing); err != nil {
 		t.Fatalf("deleteCertificateFromStore: %v", err)
 	}
 
-	// The certificate must no longer be present in the store.
+	if got := sha256.Sum256(unsafe.Slice(held.EncodedCert, int(held.Length))); got != fp {
+		t.Fatalf("held reference changed after delete: %x, want %x", got, fp)
+	}
 	again, err := findCertBySHA256(store, fp)
 	if err != nil {
 		t.Fatalf("findCertBySHA256 after delete: %v", err)
@@ -363,5 +370,52 @@ func TestDeleteCertificateFromStoreOwnership(t *testing.T) {
 	if again != nil {
 		windows.CertFreeCertificateContext(again)
 		t.Fatal("certificate still present in memory store after delete")
+	}
+}
+
+// TestRemoveTrustPathsDoNotFreeAfterDelete is a source check of the CryptoAPI
+// ownership contract: both removal paths delete through
+// deleteCertificateFromStore and never call CertFreeCertificateContext (the
+// delete already frees the context, also on failure), and the helper itself
+// only deletes.
+func TestRemoveTrustPathsDoNotFreeAfterDelete(t *testing.T) {
+	f, err := parser.ParseFile(token.NewFileSet(), "truststore_windows.go", nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]map[string]int{
+		"RemoveTrust":                {"deleteCertificateFromStore": 1, "CertDeleteCertificateFromStore": 0, "CertFreeCertificateContext": 0},
+		"RemoveTrustBySHA256":        {"deleteCertificateFromStore": 1, "CertDeleteCertificateFromStore": 0, "CertFreeCertificateContext": 0},
+		"deleteCertificateFromStore": {"CertDeleteCertificateFromStore": 1, "CertFreeCertificateContext": 0},
+	}
+	seen := map[string]bool{}
+	for _, decl := range f.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || want[fn.Name.Name] == nil || fn.Body == nil {
+			continue
+		}
+		seen[fn.Name.Name] = true
+		calls := map[string]int{}
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			if call, ok := n.(*ast.CallExpr); ok {
+				switch fun := call.Fun.(type) {
+				case *ast.Ident:
+					calls[fun.Name]++
+				case *ast.SelectorExpr:
+					calls[fun.Sel.Name]++
+				}
+			}
+			return true
+		})
+		for name, n := range want[fn.Name.Name] {
+			if calls[name] != n {
+				t.Errorf("%s calls %s %d times, want %d", fn.Name.Name, name, calls[name], n)
+			}
+		}
+	}
+	for name := range want {
+		if !seen[name] {
+			t.Errorf("function %s not found in truststore_windows.go", name)
+		}
 	}
 }

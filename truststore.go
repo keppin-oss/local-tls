@@ -17,12 +17,14 @@ var ErrTrustAnchorNotFound = errors.New("trust anchor certificate not found in L
 type TrustState int
 
 const (
-	// TrustHealthy means the expected CA certificate is present exactly once
-	// in the machine trust store.
+	// TrustHealthy means the expected CA certificate (matched by its exact
+	// SHA-256 fingerprint) is present in the machine trust store. Other
+	// certificates with the same subject are not examined in that case, so
+	// TrustHealthy does not prove that no other Local-TLS CA anchor exists.
 	TrustHealthy TrustState = iota
 
 	// TrustAbsent means the expected CA certificate is not present in the
-	// machine trust store. Repair (elevated provisioning) is required.
+	// machine trust store. Manual resolution is required.
 	TrustAbsent
 
 	// TrustConflict means a certificate with a matching subject name but a
@@ -51,7 +53,7 @@ func (s TrustState) String() string {
 
 // TrustProvisioner performs elevated certificate trust operations.
 // Mutating operations MUST only be called from an elevated context
-// (installer, provisioning, repair). Normal runtime MUST NOT use this.
+// (installer, provisioning, cleanup). Normal runtime MUST NOT use this.
 type TrustProvisioner interface {
 	// InstallTrust installs the CA certificate DER into the machine
 	// trust store. It is idempotent: if the exact same certificate

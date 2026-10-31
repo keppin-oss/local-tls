@@ -1,7 +1,7 @@
 //go:build windows
 
-// Command provision demonstrates the elevated first-install/repair flow using
-// ProvisionMachine.
+// Command provision demonstrates the elevated first-install / verification flow
+// using ProvisionMachine.
 //
 // WARNING — this mutates machine state:
 //   - creates or opens machine-scoped persisted CNG keys (CA + server);
@@ -29,8 +29,8 @@ import (
 )
 
 func main() {
-	// Elevated provisioning / repair. Never called in normal per-process
-	// startup; this is installer/repair behavior.
+	// Elevated first install / verification. Never called in normal per-process
+	// startup; this is installer behavior. It does not renew or repair trust.
 	material, err := localtls.ProvisionMachine()
 	if err != nil {
 		// Fails closed on inconsistent state rather than silently

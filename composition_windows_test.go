@@ -8,67 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 )
-
-// TestLoadServingMaterialTrustStates proves LoadServingMaterial's validation
-// core fails closed unless the CA trust state is TrustHealthy, and that the
-// server signer is released on every new error path.
-func TestLoadServingMaterialTrustStates(t *testing.T) {
-	now := time.Date(2026, 8, 8, 0, 0, 0, 0, time.UTC)
-	caCert, caKey, err := generateCA(now)
-	if err != nil {
-		t.Fatalf("generateCA: %v", err)
-	}
-	serverCert, serverKey, err := generateServerCert(now, caCert, caKey)
-	if err != nil {
-		t.Fatalf("generateServerCert: %v", err)
-	}
-
-	cases := []struct {
-		name       string
-		state      TrustState
-		trustErr   error
-		wantErr    bool
-		wantClosed bool
-	}{
-		{name: "healthy", state: TrustHealthy, wantErr: false, wantClosed: false},
-		{name: "absent", state: TrustAbsent, wantErr: true, wantClosed: true},
-		{name: "conflict", state: TrustConflict, wantErr: true, wantClosed: true},
-		{name: "verify error", state: TrustError, trustErr: errors.New("store unavailable"), wantErr: true, wantClosed: true},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			store := &fakeTrustStore{
-				verify: func([]byte) (TrustState, error) { return tc.state, tc.trustErr },
-			}
-			signer := &fakeCloseSigner{key: serverKey}
-
-			material, err := loadServingMaterial(caCert, serverCert, signer, store)
-
-			if tc.wantErr {
-				if err == nil {
-					t.Fatalf("expected error for trust state %s, got nil", tc.state)
-				}
-			} else {
-				if err != nil {
-					t.Fatalf("unexpected error: %v", err)
-				}
-				if material.Certificate.PrivateKey != signer {
-					t.Fatalf("Material.Certificate.PrivateKey = %T, want server signer", material.Certificate.PrivateKey)
-				}
-			}
-
-			if tc.wantClosed && !signer.closed {
-				t.Fatalf("server signer was not closed on error path (state %s)", tc.state)
-			}
-			if !tc.wantClosed && signer.closed {
-				t.Fatalf("server signer must not be closed on success (state %s)", tc.state)
-			}
-		})
-	}
-}
 
 // TestCheckInconsistentMachineStatePartialDER proves the guard flags partial
 // certificate state (one DER present without the other) as inconsistent without

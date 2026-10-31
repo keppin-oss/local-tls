@@ -5,9 +5,15 @@ import (
 	"errors"
 )
 
-// ErrKeyNotFound indicates that the exact persisted CNG key does not exist.
-// Cleanup treats this as an idempotent success, not a failure.
-var ErrKeyNotFound = errors.New("persisted CNG key not found")
+// ErrKeyNotFound indicates that the native open of the exact persisted CNG key
+// reported the key as not found OR not accessible to the caller (NTE_NOT_FOUND
+// or NTE_BAD_KEYSET). It does not prove that the key is absent: the Microsoft
+// Software KSP reports NTE_BAD_KEYSET to a caller that the key's DACL does not
+// grant. It must never by itself trigger a reset, regeneration or overwrite of
+// a key, and cleanup never treats it as a confirmed deletion (see
+// ErrKeyDeletionUnconfirmed). The returned error keeps the native HRESULT in
+// its message.
+var ErrKeyNotFound = errors.New("persisted CNG key not found or not accessible")
 
 // MachineKeyStore provides machine-scoped persistent signing keys.
 // On Windows this is backed by CNG/KSP; on other platforms it is unsupported.
@@ -39,11 +45,13 @@ func PlatformKeyStore() (MachineKeyStore, error) {
 // only by exact persisted key name — never by wildcard or CN.
 type MachineKeyDeleter interface {
 	// DeleteCAKey deletes the exact persisted Local-TLS CA key.
-	// Returns ErrKeyNotFound when the key does not exist.
+	// Returns ErrKeyNotFound when the key was not found or is not
+	// accessible: nothing was deleted, and absence is not proven.
 	DeleteCAKey() error
 
 	// DeleteServerKey deletes the exact persisted Local-TLS server key.
-	// Returns ErrKeyNotFound when the key does not exist.
+	// Returns ErrKeyNotFound when the key was not found or is not
+	// accessible: nothing was deleted, and absence is not proven.
 	DeleteServerKey() error
 }
 

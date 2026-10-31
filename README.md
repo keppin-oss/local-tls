@@ -2,30 +2,21 @@
 
 Machine-scoped TLS material lifecycle for localhost HTTPS on Windows.
 
-`local-tls` owns the creation, persistence, verification, renewal, and exact
-cleanup of the TLS material used to serve localhost HTTPS on Windows. Its
-centerpiece is a self-signed local CA certificate and a CA-signed `localhost`
-server certificate, backed by machine-scoped CNG/KSP signing keys whose private
-material never leaves Windows CNG.
-
 ## Scope
 
-- A Local TLS-owned **self-signed CA certificate** and a CA-signed
-  **`localhost` server certificate** (ECDSA P-256).
-- Machine-scoped persisted **CA and server signing keys** via Windows CNG/KSP
-  (Microsoft Software Key Storage Provider); private keys are non-exportable.
-- Persistence of **public certificate DER only** on the production machine (CNG)
-  path — private keys stay in CNG.
-- Installation, verification, and **exact** removal of the local CA trust anchor
-  in `LocalMachine\Root`.
-- Fail-closed provisioning, serving-startup, reload/renewal, and cleanup flows.
+- A self-signed local CA and a CA-signed `localhost` server certificate
+  (ECDSA P-256).
+- Machine-scoped, non-exportable CA and server keys in Windows CNG/KSP; only
+  public certificate DER is persisted on disk.
+- Exact install, verification and removal of the CA in `LocalMachine\Root`.
+- Fail-closed provisioning, serving startup, reload, cleanup, and staged
+  server-certificate renewal confirmed by the consumer.
 
 ## Non-goals
 
-`local-tls` is **not** a general-purpose TLS/PKI framework, a certificate
-manager, or a trust-store framework. It does not own enterprise CA enrollment,
-enterprise-vs-local selection policy, low-level reusable CNG/KSP key custody, the
-long-lived HTTPS listener runtime, or unrelated application state.
+Not a general-purpose TLS/PKI framework, certificate manager or trust-store
+framework. It does not own enterprise CA enrollment, the HTTPS listener runtime
+or unrelated application state.
 
 ## Quick start
 
@@ -33,17 +24,19 @@ long-lived HTTPS listener runtime, or unrelated application state.
 import "github.com/keppin-oss/local-tls"
 ```
 
-The package is named `localtls`. Machine provisioning is performed once
-(elevated); ordinary HTTPS serving startup uses `LoadServingMaterial`. Complete
-compile-safe examples live under [`examples/`](examples/):
+Package `localtls`. Provision once (elevated), then serve with
+`LoadServingMaterial`. See [`examples/`](examples/):
 
-- [`examples/serving`](examples/serving/main.go) — normal HTTPS serving startup.
-- [`examples/provision`](examples/provision/main.go) — elevated provisioning/repair.
-- [`examples/fingerprint`](examples/fingerprint/main.go) — fingerprint utilities and cleanup handoff.
+- [`serving`](examples/serving/main.go) — HTTPS serving startup.
+- [`provision`](examples/provision/main.go) — elevated first install / verification.
+- [`fingerprint`](examples/fingerprint/main.go) — fingerprints and cleanup handoff.
+
+## Upgrading from v0.1.x
+
+v0.2.0 has breaking behavior changes; see
+[Upgrading from v0.1.x](docs/README.md#upgrading-from-v01x).
 
 ## Resources
 
-- **Technical documentation:** [`docs/README.md`](docs/README.md)
-- **Examples:** [`examples/`](examples/)
-- **Module:** `github.com/keppin-oss/local-tls`
-- **License:** [Apache License 2.0](LICENSE)
+- [Technical documentation](docs/README.md)
+- License: [Apache License 2.0](LICENSE)
