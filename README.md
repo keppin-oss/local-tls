@@ -8,6 +8,9 @@ Machine-scoped TLS material lifecycle for localhost HTTPS on Windows.
   (ECDSA P-256).
 - Machine-scoped, non-exportable CA and server keys in Windows CNG/KSP; only
   public certificate DER is persisted on disk.
+- Separate key access policies: the CA key is usable only by LocalSystem and
+  elevated Administrators; the server key is also usable by LOCAL SERVICE for
+  serving.
 - Exact install, verification and removal of the CA in `LocalMachine\Root`.
 - Fail-closed provisioning, serving startup, reload, cleanup, and staged
   server-certificate renewal confirmed by the consumer.
@@ -25,16 +28,26 @@ import "github.com/keppin-oss/local-tls"
 ```
 
 Package `localtls`. Provision once (elevated), then serve with
-`LoadServingMaterial`. See [`examples/`](examples/):
+`LoadServingMaterial` from a principal the server key authorizes (for example
+LOCAL SERVICE). `ReloadMachine`, `StageServerRenewal`,
+`MigrateMachineKeyPolicies` and cleanup are administrative operations; see the
+[privilege and access matrix](docs/README.md#privilege-and-access-matrix).
+See [`examples/`](examples/):
 
 - [`serving`](examples/serving/main.go) — HTTPS serving startup.
 - [`provision`](examples/provision/main.go) — elevated first install / verification.
 - [`fingerprint`](examples/fingerprint/main.go) — fingerprints and cleanup handoff.
 
-## Upgrading from v0.1.x
+## Upgrading
 
-v0.2.0 has breaking behavior changes; see
-[Upgrading from v0.1.x](docs/README.md#upgrading-from-v01x).
+- **From v0.2.x to v0.3.0** — breaking: `ReloadMachine` and
+  `StageServerRenewal` now require a privileged caller, and existing
+  installations need an explicit, privileged `MigrateMachineKeyPolicies()` run
+  by the installer/updater. Upgrading the library alone does not protect a
+  legacy CA key. See
+  [Upgrading from v0.2.x to v0.3.0](docs/README.md#upgrading-from-v02x-to-v030).
+- **From v0.1.x** — v0.2.0 has breaking behavior changes; see
+  [Upgrading from v0.1.x](docs/README.md#upgrading-from-v01x).
 
 ## Resources
 

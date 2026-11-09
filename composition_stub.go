@@ -45,6 +45,11 @@ func ConfirmServingCandidate(ref CandidateRef) error {
 	return fmt.Errorf("serving candidate confirmation is not supported on this platform; Windows only")
 }
 
+// MigrateMachineKeyPolicies is not supported on non-Windows platforms.
+func MigrateMachineKeyPolicies() error {
+	return fmt.Errorf("key policy migration is not supported on this platform; Windows only")
+}
+
 // AbandonServingCandidate is not supported on non-Windows platforms.
 func AbandonServingCandidate(ref CandidateRef) error {
 	return fmt.Errorf("serving candidate abandon is not supported on this platform; Windows only")
