@@ -34,9 +34,10 @@ type Material struct {
 // uninstall/cleanup.
 //
 // Close is safe to call after a successful production machine operation. It is
-// idempotent in effect: the underlying CNG signer's Close is safe to call
-// repeatedly and reports no error. After Close, the serving certificate must
-// not be used for new TLS handshakes.
+// idempotent in effect: the first Close of the underlying CNG signer may report
+// a failure to release a native handle, which is returned and never retried;
+// repeated calls are harmless and return nil. After Close, the serving
+// certificate must not be used for new TLS handshakes.
 //
 // Material is single-owner: do not copy it by value and then reuse the copy
 // after Close, since both copies reference the same underlying signer.

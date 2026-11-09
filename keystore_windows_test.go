@@ -97,21 +97,194 @@ func TestUsesSharedWindowscngPackage(t *testing.T) {
 }
 
 // TestKeyRolesDelegateCustodyToWindowscng proves both the CA and server key
-// roles delegate open/create/delete custody to the shared windowscng package,
-// rather than retaining a second native implementation.
+// roles delegate open/create/delete custody to the shared windowscng package
+// through the policy-aware API, rather than retaining a second native
+// implementation.
 func TestKeyRolesDelegateCustodyToWindowscng(t *testing.T) {
 	src, ok := localTLSImplFiles(t)["keystore_windows.go"]
 	if !ok {
 		t.Fatal("keystore_windows.go not found")
 	}
 	for _, call := range []string{
-		"windowscng.LoadOrCreate",
-		"windowscng.Open",
+		"windowscng.LoadOrCreateWithPolicy",
+		"windowscng.OpenWithPolicy",
+		"windowscng.ApplyPolicy",
 		"windowscng.Delete",
 	} {
 		if !strings.Contains(src, call) {
 			t.Errorf("keystore_windows.go does not delegate to %s", call)
 		}
+	}
+}
+
+// legacyPolicyFreeCalls are the windowscng v0.1 functions that open or create
+// a key with the single shared service-signer DACL and validate it without a
+// per-key policy. Production key custody must not use them.
+var legacyPolicyFreeCalls = []string{"windowscng.Open(", "windowscng.LoadOrCreate("}
+
+// TestProductionCodeAvoidsLegacyPolicyFreeCNG proves that no production
+// implementation file opens or creates a key through the legacy, policy-free
+// windowscng functions. verify_windows.go is the only exception: its exported
+// Test* helpers are restricted to the Keppin.Test.* namespace and never touch
+// a production key name.
+func TestProductionCodeAvoidsLegacyPolicyFreeCNG(t *testing.T) {
+	for file, src := range localTLSImplFiles(t) {
+		if file == "verify_windows.go" {
+			continue
+		}
+		for _, call := range legacyPolicyFreeCalls {
+			if strings.Contains(src, call) {
+				t.Errorf("%s calls legacy policy-free %s; use the per-role policy API", file, call)
+			}
+		}
+	}
+	src := localTLSImplFiles(t)["verify_windows.go"]
+	for _, name := range []string{"caKeyName", "serverKeyName", "ProdCAKeyName", "ProdServerKeyName"} {
+		if strings.Contains(src, name) {
+			t.Errorf("verify_windows.go (legacy test-namespace helpers) must not reference production key %s", name)
+		}
+	}
+}
+
+// TestKeyPolicyPerRole proves the policy assigned to each production key role
+// and that an unknown name has no policy.
+func TestKeyPolicyPerRole(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		want windowscng.Policy
+	}{
+		{caKeyName, windowscng.PolicyPrivilegedOnly},
+		{serverKeyName, windowscng.PolicyServiceSigner},
+	} {
+		got, err := keyPolicy(tc.name)
+		if err != nil || got != tc.want {
+			t.Errorf("keyPolicy(%q) = %v, %v; want %v", tc.name, got, err, tc.want)
+		}
+	}
+	for _, name := range []string{"", identity.TestKeyNamespace + "x", caKeyName + "x", strings.ToLower(caKeyName)} {
+		if _, err := keyPolicy(name); err == nil {
+			t.Errorf("keyPolicy(%q) returned a policy; want an error", name)
+		}
+	}
+}
+
+// recordingPolicyAPI is a cngPolicyAPI fake that records every call and never
+// touches a machine key.
+type recordingPolicyAPI struct {
+	calls []string
+	err   error
+}
+
+func (r *recordingPolicyAPI) api() cngPolicyAPI {
+	signer := func(op, name string, p windowscng.Policy) (windowscng.Signer, error) {
+		r.calls = append(r.calls, op+" "+name+" "+p.String())
+		if r.err != nil {
+			return nil, r.err
+		}
+		return newFakeCloseSigner(), nil
+	}
+	return cngPolicyAPI{
+		open: func(name string, p windowscng.Policy) (windowscng.Signer, error) {
+			return signer("open", name, p)
+		},
+		loadOrCreate: func(name string, p windowscng.Policy) (windowscng.Signer, error) {
+			return signer("loadOrCreate", name, p)
+		},
+		apply: func(name string, p windowscng.Policy) error {
+			r.calls = append(r.calls, "apply "+name+" "+p.String())
+			return r.err
+		},
+	}
+}
+
+// TestProductionKeyOperationsUseRolePolicy proves that open, open-or-create and
+// tighten pass exactly the role policy of each key to windowscng.
+func TestProductionKeyOperationsUseRolePolicy(t *testing.T) {
+	rec := &recordingPolicyAPI{}
+	api := rec.api()
+	for _, name := range []string{caKeyName, serverKeyName} {
+		if _, err := openProductionKeyWith(api, name); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := loadOrCreateKeyWith(api, name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tightenCAKeyPolicyWith(api); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"open " + caKeyName + " privileged-only",
+		"loadOrCreate " + caKeyName + " privileged-only",
+		"open " + serverKeyName + " service-signer",
+		"loadOrCreate " + serverKeyName + " service-signer",
+		"apply " + caKeyName + " privileged-only",
+	}
+	if strings.Join(rec.calls, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("calls:\n%s\nwant:\n%s", strings.Join(rec.calls, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+// TestProductionKeyOperationsRejectUnknownName proves no windowscng call is
+// made for a name without a role policy.
+func TestProductionKeyOperationsRejectUnknownName(t *testing.T) {
+	rec := &recordingPolicyAPI{}
+	api := rec.api()
+	name := identity.TestKeyNamespace + "Unknown"
+	if _, err := openProductionKeyWith(api, name); err == nil {
+		t.Error("open of an unknown name succeeded")
+	}
+	if _, err := loadOrCreateKeyWith(api, name); err == nil {
+		t.Error("open-or-create of an unknown name succeeded")
+	}
+	if len(rec.calls) != 0 {
+		t.Fatalf("windowscng called for an unknown name: %v", rec.calls)
+	}
+}
+
+// TestProductionKeyOperationsMapPolicyErrors proves that the policy-aware
+// windowscng failures reach callers as Local-TLS sentinels.
+func TestProductionKeyOperationsMapPolicyErrors(t *testing.T) {
+	for _, tc := range []struct {
+		cngErr error
+		want   error
+	}{
+		{fmt.Errorf("key %q: NCryptOpenKey hr=0x80090016: %w", caKeyName, windowscng.ErrKeyNotFound), ErrKeyNotFound},
+		{fmt.Errorf("key %q (privileged-only): %w: persisted DACL is service-signer", caKeyName, windowscng.ErrPolicyMismatch), ErrKeyPolicyMismatch},
+		{windowscng.ErrPrivilegeRequired, ErrPrivilegeRequired},
+	} {
+		rec := &recordingPolicyAPI{err: tc.cngErr}
+		api := rec.api()
+		if _, err := openProductionKeyWith(api, caKeyName); !errors.Is(err, tc.want) {
+			t.Errorf("open: %v, want %v", err, tc.want)
+		}
+		if _, err := loadOrCreateKeyWith(api, caKeyName); !errors.Is(err, tc.want) {
+			t.Errorf("loadOrCreate: %v, want %v", err, tc.want)
+		}
+		if err := tightenCAKeyPolicyWith(api); !errors.Is(err, tc.want) {
+			t.Errorf("apply: %v, want %v", err, tc.want)
+		}
+	}
+}
+
+// TestMapCNGErrorPolicySentinels proves the policy and privilege sentinels are
+// mapped, keep the shared chain (for example ErrCleanupFailed) and are never
+// turned into ErrKeyNotFound.
+func TestMapCNGErrorPolicySentinels(t *testing.T) {
+	cleanup := errors.Join(fmt.Errorf("created key failed verification: %w", windowscng.ErrPolicyMismatch), windowscng.ErrCleanupFailed)
+	err := mapCNGError(cleanup)
+	if !errors.Is(err, ErrKeyPolicyMismatch) || !errors.Is(err, windowscng.ErrCleanupFailed) {
+		t.Fatalf("mapped %v must match ErrKeyPolicyMismatch and keep ErrCleanupFailed", err)
+	}
+	if errors.Is(err, ErrKeyNotFound) || errors.Is(err, ErrPrivilegeRequired) {
+		t.Fatalf("policy mismatch mapped to another sentinel: %v", err)
+	}
+	err = mapCNGError(windowscng.ErrPrivilegeRequired)
+	if !errors.Is(err, ErrPrivilegeRequired) || errors.Is(err, ErrKeyNotFound) {
+		t.Fatalf("privilege error mapped to %v", err)
+	}
+	if mapCNGError(nil) != nil {
+		t.Fatal("mapCNGError(nil) must be nil")
 	}
 }
 

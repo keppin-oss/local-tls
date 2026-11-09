@@ -15,8 +15,11 @@ import (
 
 const testKeyPrefix = identity.TestKeyNamespace
 
-// TestCreateKey creates a persisted CNG test key with the given name using the
-// same security path as production keys. The name must stay in the test namespace.
+// TestCreateKey creates a persisted CNG test key with the given name. It uses
+// the legacy policy-free windowscng.LoadOrCreate, so the key gets the legacy
+// service-signer DACL; it does NOT follow the per-role key policies of the
+// production keys (the CA key is privileged-only). The name must stay in the
+// test namespace.
 func TestCreateKey(name string) (crypto.Signer, error) {
 	if !strings.HasPrefix(name, testKeyPrefix) {
 		return nil, fmt.Errorf("test key name must start with %q", testKeyPrefix)

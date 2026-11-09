@@ -18,4 +18,7 @@ func TestRenewalAPIUnsupportedOffWindows(t *testing.T) {
 	if err := AbandonServingCandidate(ref); err == nil {
 		t.Fatal("AbandonServingCandidate must fail off Windows")
 	}
+	if err := MigrateMachineKeyPolicies(); err == nil {
+		t.Fatal("MigrateMachineKeyPolicies must fail off Windows")
+	}
 }

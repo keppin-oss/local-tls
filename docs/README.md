@@ -9,8 +9,12 @@ Every claim in this document is traceable to the source, the tests, the build
 tags, or `go.mod`. Where a behavior is not demonstrable from this repository, it
 is labeled explicitly.
 
-Upgrading from v0.1.x? Read [Upgrading from v0.1.x](#upgrading-from-v01x)
-first: v0.2.0 contains intentional breaking behavior changes.
+This document describes **v0.3.0**. Upgrading from v0.2.x? Read
+[Upgrading from v0.2.x to v0.3.0](#upgrading-from-v02x-to-v030) first: v0.3.0
+changes who may call several entry points and requires an explicit, privileged
+key-ACL migration on existing installations. Upgrading from v0.1.x? Also read
+[Upgrading from v0.1.x](#upgrading-from-v01x): v0.2.0 contains intentional
+breaking behavior changes.
 
 ---
 
@@ -86,32 +90,43 @@ trust-store framework.
   and tests on non-Windows via stubs, but the production machine functions return
   explicit unsupported-platform errors (see
   [Windows / platform behavior](#windows--platform-behavior)).
-- **Administrator elevation** is required for `ProvisionMachine`, `CleanupMachine`,
-  and `CleanupMachineBySHA256` (caller responsibility). On first install,
-  `ProvisionMachine` itself fails closed for a caller that is not LocalSystem or
-  an elevated Administrator, or whose privilege cannot be determined (policy).
-  `LoadServingMaterial`, `LoadServingCandidate`, `ReloadMachine`, and read-only
-  trust verification do not mutate machine trust and do not require elevation,
-  but the calling process must be able to open the persisted key(s) they use
-  (caller responsibility). The renewal steps that write (`StageServerRenewal`,
-  `ConfirmServingCandidate`, `AbandonServingCandidate`) need write access to the
-  TLS state directory; `StageServerRenewal` also opens the CA key.
+- **Administrative operations** — `ProvisionMachine`, `ReloadMachine`,
+  `StageServerRenewal`, `MigrateMachineKeyPolicies`, `CleanupMachine` and
+  `CleanupMachineBySHA256` must be called by LocalSystem or an elevated
+  Administrators member (caller responsibility). The first four open the
+  privileged-only CA key and fail closed otherwise (policy; see
+  [Key access policies](#key-access-policies)); cleanup needs the same
+  authority to delete the keys and the trust anchor.
+- **Serving operations** — `LoadServingMaterial` and `LoadServingCandidate`
+  need a principal that the server key DACL actually authorizes (in practice
+  LOCAL SERVICE, LocalSystem or an elevated Administrator) plus read access to
+  the TLS state files. "Not elevated" does not mean "authorized": a
+  UAC-filtered Administrator token cannot open the server key either.
+- **Renewal consumer steps** — `ConfirmServingCandidate` needs **both** access to
+  the server key and the filesystem rights listed in
+  [Filesystem access](#filesystem-access); `AbandonServingCandidate` opens no key
+  but needs the filesystem rights for its files. See
+  [Privilege and access matrix](#privilege-and-access-matrix).
+- **Filesystem ACLs** on the TLS state directory are set by the installer or
+  updater, not by Local TLS (caller responsibility; see
+  [Filesystem access](#filesystem-access)).
 - **Single lifecycle writer** (caller responsibility). One lifecycle coordinator
   per machine must ensure that provisioning, cleanup/uninstall, administrative
   recovery and every server-certificate renewal attempt (the whole sequence
   `StageServerRenewal` → `LoadServingCandidate` → consumer activation and
   attestation → `ConfirmServingCandidate` or `AbandonServingCandidate`) never
   overlap, and that no other actor creates, deletes or re-permissions the
-  Local TLS key names or state directory while they run. Local TLS does **not**
-  implement or verify this serialization. The digest checks of the renewal API
-  detect some violations, not all; they are not a lock.
+  Local TLS key names or state directory while they run. The key-ACL migration
+  (`MigrateMachineKeyPolicies`) is part of the same serialization. Local TLS
+  does **not** implement or verify this serialization. The digest checks of the
+  renewal API detect some violations, not all; they are not a lock.
 - **Microsoft Software Key Storage Provider** is the only supported key store.
 - **Go** — the module declares `go 1.26.8`.
 
 ### Dependencies
 
 ```
-github.com/keppin-oss/cng v0.2.0      // windowscng — CNG/KSP key custody
+github.com/keppin-oss/cng v0.2.1      // windowscng — CNG/KSP key custody
 golang.org/x/sys        v0.47.0       // Windows syscall bindings
 ```
 
@@ -160,6 +175,10 @@ func ReloadMachine() (Material, error)
 func LoadServingMaterial() (Material, error)
 func CleanupMachine() error
 func CleanupMachineBySHA256(fp [32]byte) error
+
+// Explicit, privileged key-ACL migration for installations provisioned before
+// the CA key was separated from the server signer
+func MigrateMachineKeyPolicies() error
 
 // Staged server-certificate renewal
 func StageServerRenewal() (CandidateRef, error)
@@ -232,6 +251,8 @@ var (
 	ErrPromotionUnconfirmed error
 
 	ErrKeyNotFound            error // CNG key not found OR not accessible
+	ErrKeyPolicyMismatch      error // key DACL is not its role policy; key unchanged
+	ErrPrivilegeRequired      error // CA key or migration needs SYSTEM/elevated Administrators
 	ErrKeyDeletionUnconfirmed error // cleanup could not confirm a key deletion
 	ErrTrustAnchorNotFound    error // exact trust anchor already absent
 )
@@ -259,6 +280,127 @@ persisted key reported it as **not found or not accessible**: it does **not**
 prove that the key is absent, and it must never by itself trigger a reset,
 regeneration or overwrite of a key (policy). Its message keeps the native
 HRESULT.
+
+### Key access policies
+
+Each production key has its own DACL policy, applied through the policy-aware
+API of `github.com/keppin-oss/cng/windowscng` (`OpenWithPolicy`,
+`LoadOrCreateWithPolicy`, `ApplyPolicy`):
+
+| Key | Policy | DACL | Who can open it |
+| --- | --- | --- | --- |
+| CA key | `PolicyPrivilegedOnly` | `D:P(A;;GA;;;SY)(A;;GA;;;BA)` | LocalSystem, elevated Administrators |
+| Server key | `PolicyServiceSigner` | `D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGX;;;LS)` | the above and **any** process running as LOCAL SERVICE |
+
+The Microsoft Software KSP stores the expanded access masks rather than the
+generic rights requested (`GA` is read back as `0xd01f01ff`, `GRGX` as
+`0x801200a9`); `windowscng` normalizes them when it compares a DACL with a
+policy. This was observed on a real Windows 11 KSP (see
+[Windows validation of the key policies](#windows-validation-of-the-key-policies)).
+
+- Every open verifies that the persisted DACL is **exactly** the role policy;
+  anything else fails closed with `ErrKeyPolicyMismatch` and the key is not
+  modified.
+- Creation happens only on first install, only for a privileged caller, and only
+  when the native open reports the key as not found; any other open failure is
+  returned without creating a key.
+- `CleanupMachine` deletes by exact name and does not depend on the policy.
+- Installations provisioned before v0.3.0 have a CA key with the server signer
+  DACL. Serving keeps working on them, but `ProvisionMachine`, `ReloadMachine`
+  and `StageServerRenewal` fail with `ErrKeyPolicyMismatch` until an elevated
+  caller runs `MigrateMachineKeyPolicies` once. Local-TLS never migrates
+  implicitly. See [Upgrading from v0.2.x to v0.3.0](#upgrading-from-v02x-to-v030).
+
+What these policies do and do not isolate:
+
+- **CA key vs. server signer.** After migration (or on a v0.3.0 first install),
+  no LOCAL SERVICE process can open the CA key; only the server key is usable by
+  a non-privileged runtime.
+- **Shared LOCAL SERVICE identity.** The server key DACL grants the shared
+  well-known LOCAL SERVICE SID (`S-1-5-19`), not a dedicated Agent identity.
+  Every process running as LOCAL SERVICE on the machine can use the server
+  signing key. Local TLS does **not** isolate the Agent from other LOCAL SERVICE
+  processes, and v0.3.0 introduces no service-specific SID.
+- **UAC-filtered Administrators.** In a filtered (non-elevated) token the
+  Administrators group is deny-only, so the `BA` entry does not apply: such a
+  caller can open **neither** key. Authorization depends on the effective
+  token, not on whether the account is an administrator.
+- **Before migration, the CA key is still exposed.** A legacy CA key keeps its
+  LOCAL SERVICE entry until `MigrateMachineKeyPolicies` succeeds. The v0.3.0
+  API refuses to use it, but any LOCAL SERVICE process can still open it
+  through the native CNG API. Upgrading the library **without** running the
+  migration does not mitigate that exposure.
+- **Open handles.** Rewriting the CA key DACL denies new opens; it is not
+  assumed to revoke handles that a process already holds. See the cutover
+  procedure in [Upgrading from v0.2.x to v0.3.0](#upgrading-from-v02x-to-v030).
+
+### Privilege and access matrix
+
+"Privileged" means LocalSystem or an elevated Administrators member. "Server
+key principal" means a token that the server key DACL actually authorizes
+(LOCAL SERVICE, LocalSystem, elevated Administrators). The filesystem column
+names what the operation does on the TLS state directory; the rights it implies
+are listed in [Filesystem access](#filesystem-access).
+
+| Operation | Caller | Keys opened | TLS state directory | `LocalMachine\Root` |
+| --- | --- | --- | --- | --- |
+| `ProvisionMachine` (first install) | privileged | CA + server, created under their role policies | creates the directory; writes `ca-cert.der`, `server-cert.der` via temporaries + rename | installs the exact CA |
+| `ProvisionMachine` (existing state) | privileged | CA + server through the `MachineKeyStore` open-or-create seam | reads only | read-only verification |
+| `ReloadMachine` | privileged | CA + server, open-only | reads `ca-cert.der`, `server-cert.der` | read-only verification |
+| `StageServerRenewal` | privileged | CA (signs) + server (verifies), open-only | reads DER; creates/replaces/deletes `server-cert.pending.der`; creates and removes `.localtls-tmp-*` | read-only verification |
+| `MigrateMachineKeyPolicies` | privileged | server (verify only), CA (DACL rewritten, then verified) | reads `ca-cert.der`, `server-cert.der` | not touched |
+| `LoadServingMaterial` | server key principal | server only | reads `ca-cert.der`, `server-cert.der` | read-only verification |
+| `LoadServingCandidate` | server key principal | server only | reads `ca-cert.der`, `server-cert.der`, `server-cert.pending.der` | read-only verification |
+| `ConfirmServingCandidate` | server key principal **and** filesystem rights | server only | reads all four files; writes `server-cert.prev.der` via temporary + rename; renames `server-cert.pending.der` over `server-cert.der`; on a retry after promotion may delete `server-cert.pending.der` | read-only verification |
+| `AbandonServingCandidate` | filesystem rights only | none | reads `server-cert.der`, `server-cert.pending.der`; deletes `server-cert.pending.der` | not touched |
+| `CleanupMachine`, `CleanupMachineBySHA256` | privileged | CA + server deleted by exact name | deletes the whole directory | removes the exact anchor |
+
+No serving or candidate path opens the CA key. Errors are not ordered by
+privilege: `ReloadMachine` reads the CA DER before it opens the CA key, and
+`StageServerRenewal` validates the CA, checks trust and reads the persisted
+leaf before it opens the CA key. A non-privileged caller may therefore get a
+file, validation or trust error first; `ErrPrivilegeRequired` is guaranteed
+only when the CA key open is reached, and that open is denied before any native
+key handle is obtained. `ErrPrivilegeRequired` from a key open comes from the
+`windowscng` check of the calling thread's token; `MigrateMachineKeyPolicies`
+and the first-install pre-check use Local TLS's own check of the process
+token. Both fail closed, but they can differ under impersonation.
+
+### Filesystem access
+
+Local TLS does **not** set or verify ACLs on the TLS state directory or its
+files. The `0700` / `0600` permission bits passed to the Go file APIs are not a
+Windows ACL specification: on Windows they do not restrict which principals can
+read, write, rename or delete the files. The resulting files inherit the ACL of
+`%ProgramData%\Keppin\Agent\tls` and its parents.
+
+**Owner: the installer/updater** (caller responsibility). It must create or
+re-permission the directory so that each principal has the rights its
+operations need and no more:
+
+| Principal role | Needs on `...\Agent\tls` |
+| --- | --- |
+| serving (`LoadServingMaterial`, `LoadServingCandidate`) | read `ca-cert.der`, `server-cert.der`, `server-cert.pending.der` |
+| renewal authority (`StageServerRenewal`) | read the DER files; create, write, rename (replace) and delete `server-cert.pending.der` and `.localtls-tmp-*` temporaries; list the directory |
+| consumer `ConfirmServingCandidate` | read all four files; create, write and rename `.localtls-tmp-*` over `server-cert.prev.der` (replace); rename `server-cert.pending.der` over `server-cert.der` (replace, which also needs delete on the replaced file); delete `server-cert.pending.der` |
+| consumer `AbandonServingCandidate` | read `server-cert.der` and `server-cert.pending.der`; delete `server-cert.pending.der` |
+| administrative (provision, migration, cleanup) | full control of the directory |
+
+Security notes for the deployment:
+
+- Write access to the TLS state is **not** the authority to issue
+  certificates (that requires the CA key), but it is not harmless: it allows
+  altering or deleting state (availability) and replaying older public material
+  that still validates. Grant it only to the principals that need it.
+- `ca-cert.der` must be modifiable only by administrative principals. Note that
+  rights granted at directory level for Confirm (replace/delete of children)
+  can also allow replacing other files in the same directory; the deployment
+  must evaluate the ACL layout it chooses. Local TLS does not prescribe one.
+- Protect the directory path itself against replacement (for example of a
+  parent directory) by unauthorized principals.
+- All files, temporaries, pending and backup must stay in that one directory
+  on a local NTFS volume (see
+  [Writes, interruption and power loss](#writes-interruption-and-power-loss)).
 
 ### Trust APIs
 
@@ -321,7 +463,12 @@ The package also exports Windows-only test/smoke helpers (`TestCreateKey`,
 `CleanupSmoke`, `VerifySmokeTrust`, `CleanupSmokeAnchorBySHA256`,
 `SmokeCAKeyName`, `SmokeServerKeyName`) scoped to the `Keppin.Test.*` namespace.
 These are testing surfaces, not production APIs; see
-[Smoke helpers](#smoke-helpers).
+[Smoke helpers](#smoke-helpers). They still use the policy-free `windowscng`
+API, which creates **every** test key with the service-signer DACL (LOCAL
+SERVICE included) and accepts only that form. They therefore do
+**not** follow the production key access policies: a smoke CA key is not
+privileged-only, as the source comment of `TestCreateKey` also states.
+Their name prefix check keeps them away from the production key names.
 
 ## Provisioning flow
 
@@ -390,8 +537,15 @@ before trust installation leaves complete DER with `TrustAbsent`, which a later
   `ErrTrustNotHealthy` unless the CA is `TrustHealthy`;
 - never renews, never writes, and never mutates `LocalMachine\Root`.
 
-`ReloadMachine()` is the full-state verification path:
+`ReloadMachine()` is the **administrative** full-state verification path:
 
+- **requires a privileged caller** (LocalSystem or elevated Administrators),
+  because it opens the privileged-only CA key to prove that it matches the CA
+  certificate. When it reaches the CA key open, a non-privileged caller gets
+  `ErrPrivilegeRequired` without a key handle being obtained, and a CA key that
+  still has the legacy DACL gets `ErrKeyPolicyMismatch` until
+  `MigrateMachineKeyPolicies` has run. Earlier errors (CA DER missing or
+  unreadable) are returned first;
 - opens **both** the CA and server keys (open-only, never creates);
 - applies the same certificate, validity and trust checks;
 - never writes and never mutates `LocalMachine\Root`;
@@ -400,17 +554,38 @@ before trust installation leaves complete DER with `TrustAbsent`, which a later
   (an expired certificate also matches `ErrCertificateNotValidNow`). CA, key,
   identity and trust failures detected first are returned with their own errors.
 
+**`ReloadMachine` and `LoadServingMaterial` are not interchangeable.** The
+separation already exists in the API; v0.3.0 adds no `ReloadServing` alias and
+does not reduce `ReloadMachine` to a check that skips the CA key:
+
+| | `ReloadMachine` | `LoadServingMaterial` |
+| --- | --- | --- |
+| Purpose | administrative verification of the complete machine state | load or reload the material for the HTTPS listener |
+| Caller | privileged | server key principal (e.g. LOCAL SERVICE) |
+| CA key | opened and matched against the CA certificate | never opened |
+| Leaf inside `RenewalThreshold`, still valid | fails with `ErrRenewalDue` | returns the material (`nil` error) |
+| Expired leaf | `ErrRenewalDue` + `ErrCertificateNotValidNow` | `ErrCertificateNotValidNow` |
+
+A non-privileged runtime that called `ReloadMachine` in v0.2.x must switch to
+`LoadServingMaterial` and must **not** be elevated to keep calling
+`ReloadMachine`. Because `LoadServingMaterial` does not report `ErrRenewalDue`,
+the consumer must decide separately when to start the staged renewal (for
+example from `ServerCertificate.NotAfter` and `RenewalThreshold`, or by a
+privileged `StageServerRenewal`, which returns `RenewalNotDue` when nothing is
+due).
+
 ### Decision guide
 
-| Need | Preferred API | Elevation / mutation |
+| Need | Preferred API | Caller / mutation |
 | --- | --- | --- |
-| First install | `ProvisionMachine()` | Administrator; creates keys, writes DER, installs trust |
-| Verify existing state (installer) | `ProvisionMachine()` | Administrator; writes nothing; never repairs trust or renews |
-| Normal serving startup | `LoadServingMaterial()` | No trust mutation; opens server key only; never writes |
-| Full-state verification | `ReloadMachine()` | No trust mutation; opens CA + server keys; never writes; reports `ErrRenewalDue` |
-| Server-certificate renewal | `StageServerRenewal()` → `LoadServingCandidate(ref)` → consumer activation/attestation → `ConfirmServingCandidate(ref)` or `AbandonServingCandidate(ref)` | No trust mutation; opens existing keys only; writes public DER only |
-| Exact cleanup (DER available) | `CleanupMachine()` | Administrator; destructive |
-| Cleanup by fingerprint | `CleanupMachineBySHA256(fp)` | Administrator; destructive |
+| First install | `ProvisionMachine()` | Privileged; creates keys, writes DER, installs trust |
+| Verify existing state (installer) | `ProvisionMachine()` | Privileged; writes nothing; never repairs trust or renews |
+| Normal serving startup or reload | `LoadServingMaterial()` | Server key principal (e.g. LOCAL SERVICE); opens server key only; never writes; no trust mutation |
+| Full-state verification | `ReloadMachine()` | Privileged (CA key); opens CA + server keys; never writes; reports `ErrRenewalDue`; no trust mutation |
+| Server-certificate renewal | `StageServerRenewal()` (privileged) → `LoadServingCandidate(ref)` (server key principal) → consumer activation/attestation → `ConfirmServingCandidate(ref)` (server key principal + filesystem rights) or `AbandonServingCandidate(ref)` (filesystem rights) | No trust mutation; opens existing keys only; writes public DER only |
+| Tighten legacy key ACLs | `MigrateMachineKeyPolicies()` | Privileged; rewrites the CA key DACL in place (tighten-only, idempotent); never rotates keys, writes DER or touches trust |
+| Exact cleanup (DER available) | `CleanupMachine()` | Privileged; destructive |
+| Cleanup by fingerprint | `CleanupMachineBySHA256(fp)` | Privileged; destructive |
 
 ## Server-certificate renewal
 
@@ -418,14 +593,23 @@ Renewal keeps the CA key, the server key, the CA certificate and the trust
 anchor unchanged. Only a new public leaf is issued, and the persisted
 certificate is replaced only when the consumer requests it.
 
-| # | Event | Owner | API |
-| --- | --- | --- | --- |
-| 1 | Stage a validated candidate | Local TLS | `StageServerRenewal()` |
-| 2 | Load exactly that candidate | Local TLS | `LoadServingCandidate(ref)` |
-| 3 | Activate it in the listener | consumer | consumer code |
-| 4 | Attest that the listener serves it | consumer | consumer code |
-| 5 | Promote it to the persisted certificate | Local TLS, on request | `ConfirmServingCandidate(ref)` |
-| — | Discard the candidate | consumer request | `AbandonServingCandidate(ref)` |
+| # | Event | Owner | API | Caller |
+| --- | --- | --- | --- | --- |
+| 1 | Stage a validated candidate | Local TLS | `StageServerRenewal()` | privileged (renewal authority) |
+| 2 | Load exactly that candidate | Local TLS | `LoadServingCandidate(ref)` | server key principal |
+| 3 | Activate it in the listener | consumer | consumer code | consumer |
+| 4 | Attest that the listener serves it | consumer | consumer code | consumer |
+| 5 | Promote it to the persisted certificate | Local TLS, on request | `ConfirmServingCandidate(ref)` | server key principal + filesystem rights |
+| — | Discard the candidate | consumer request | `AbandonServingCandidate(ref)` | filesystem rights |
+
+**Owner of the renewal coordination: the consumer (Keppin Agent)** (caller
+responsibility). Steps 1 and 2–5 may run in different processes and under
+different identities (for example step 1 as LocalSystem, steps 2–5 as LOCAL
+SERVICE). One coordinator must still serialize the whole attempt — Stage →
+Load candidate → listener activation → attestation by a real, non-resumed TLS
+handshake → Confirm or Abandon — and must exclude concurrent key-ACL migration,
+provisioning and cleanup for its duration. Staging is renewal authority; the
+consumer steps never acquire CA authority.
 
 - `StageServerRenewal` verifies the CA (validity, key match, `TrustHealthy`) and
   the identity of the persisted leaf; an expired previous leaf is accepted as the
@@ -433,6 +617,9 @@ certificate is replaced only when the consumer requests it.
   `RenewalCandidateStaged`. It reuses a pending candidate only if it is valid now
   and advances the persisted certificate, and otherwise replaces it. It opens
   existing keys only, never installs trust, and never rotates keys or the CA.
+  It requires a privileged caller and a migrated CA key (`ErrPrivilegeRequired`
+  / `ErrKeyPolicyMismatch` when it reaches the CA key open; CA validity, trust
+  and persisted-leaf errors can be returned first).
 - `CandidateRef` carries the candidate, base and CA SHA-256 digests. It is public
   metadata only: **not** a secret, an authorization, a compare-and-swap token, or
   proof of activation. Keep it for the whole attempt; if it is lost, restart the
@@ -450,7 +637,10 @@ certificate is replaced only when the consumer requests it.
   attestation, not proof of it: Local TLS cannot observe the listener. It
   revalidates CA, trust, candidate and digests, writes `server-cert.prev.der` as
   a copy of the current persisted certificate, then replaces `server-cert.der`
-  with the candidate in one same-directory rename.
+  with the candidate in one same-directory rename. It **opens the server key**
+  to revalidate the candidate against it, so its caller needs both server key
+  access and the filesystem rights in [Filesystem access](#filesystem-access).
+  It never opens the CA key.
 - `AbandonServingCandidate` deletes the pending file only when it is `ref`'s
   candidate. It is an idempotent no-op when nothing is pending (not proof of a
   rollback), returns `ErrCandidateMismatch` when a different candidate is pending
@@ -459,6 +649,21 @@ certificate is replaced only when the consumer requests it.
 
 Consumer rollback before promotion: restore the previous `Material` in the
 listener, verify the restore, then call `AbandonServingCandidate`.
+
+Consumer obligations during an attempt (caller responsibility):
+
+- `CandidateRef` is not a lock and not an authorization; holding it does not
+  reserve the state against other writers.
+- `ConfirmServingCandidate` does not prove that the listener switched, and
+  `AbandonServingCandidate` does not restore the listener. Both outcomes are the
+  consumer's to verify.
+- On any error, do not assume the effect: `ErrPromotionUnconfirmed` means the
+  promotion may have happened. Retry with the same `ref`; treat `ErrCandidateStale`
+  and `ErrCandidateMismatch` as "this attempt is over" and start a new attempt
+  from `StageServerRenewal` rather than reusing the old `ref`.
+- Keep the previous `Material` open until rollback is no longer possible, and
+  `Close` each `Material` only when no handshake can use it any longer (see
+  [Lifecycle & ownership of `Material`](#lifecycle--ownership-of-material)).
 
 Retry and reconciliation (under the single-writer contract):
 
@@ -680,11 +885,30 @@ historical anchors.
   [Server-certificate renewal](#server-certificate-renewal).
 - In cleanup only `ErrTrustAnchorNotFound` is idempotent success;
   `ErrKeyNotFound` is reported as `ErrKeyDeletionUnconfirmed`.
+- `ErrPrivilegeRequired`: the caller's token is not privileged, or its
+  privilege could not be determined. It is not guaranteed to be the first error
+  a non-privileged caller sees (see
+  [Privilege and access matrix](#privilege-and-access-matrix)). Do not respond
+  by elevating a serving runtime; use the serving APIs instead.
+- `ErrKeyPolicyMismatch`: the key DACL is not exactly its role policy. On a CA
+  key this usually means the key-ACL migration has not run; any other DACL needs
+  administrative inspection. The key is never modified as a side effect.
 
 ## Security model
 
 - Private keys are machine-scoped CNG keys and never persisted as files; the
   module never handles private-key bytes.
+- The CA key is privileged-only on a v0.3.0 first install and after
+  `MigrateMachineKeyPolicies`: no LOCAL SERVICE process can then open it or
+  sign with it, and only the server key is usable by the non-privileged
+  runtime. **Before** the migration a legacy CA key stays open to every LOCAL
+  SERVICE process, whatever library version is installed (see
+  [Key access policies](#key-access-policies)).
+- The server signing key is shared by every LOCAL SERVICE process on the
+  machine; Local TLS does not isolate the Agent from them.
+- Local TLS does not enforce filesystem ACLs on the TLS state; their
+  correctness is a deployment responsibility (see
+  [Filesystem access](#filesystem-access)).
 - The CA is a path-length-zero, sign-only CA used exclusively to issue the local
   `localhost` server certificate.
 - Trust is anchored on exact SHA-256 identity, not subject name.
@@ -707,6 +931,11 @@ historical anchors.
   cleanup (verified).
 - `Close()` is idempotent in effect (verified). After `Close()`, the serving
   certificate must not be used for new handshakes.
+- With `github.com/keppin-oss/cng v0.2.1`, the first `Close()` may return an
+  error if a native handle cannot be released; the release is not retried, and
+  repeated calls are harmless and return `nil`. The CNG signer serializes `Sign`
+  and `Close`, but `Close()` does not drain callers: close a `Material` only
+  when no handshake can use it any longer.
 - `Material` is single-owner; do not copy it by value and reuse the copy after
   `Close`.
 
@@ -752,15 +981,30 @@ go test ./...
 ```
 
 On non-Windows, the Windows-specific tests are excluded by build tags. On
-Windows, the elevated lifecycle test `TestCleanupLifecycleElevated` skips when
-not running as Administrator, but the trust-store tests
-`TestTrustStoreInstallAndVerify`, `TestTrustStoreConflictingCert` and
-`TestRemoveNonExistent` use `LocalMachine\Root` directly and are not
-elevation-gated. On a machine whose trust store must not be touched, skip them:
+Windows, `go test ./...` is **not** a safe, all-green suite:
+
+- `TestCleanupLifecycleElevated` is skipped only when elevation is clearly
+  unavailable. Under a UAC-filtered (non-elevated) Administrator token its
+  elevation probe is ambiguous (the probe key cannot be finalized and its
+  rollback delete reports "not found"), so the test fails closed and is reported
+  as **FAIL**, not SKIP. This is a known result, not a v0.3.0 regression and
+  not masked as a skip. Each such run attempts to create a
+  `Keppin.Test.Smoke.elevation-probe-*` key.
+- The trust-store tests `TestTrustStoreInstallAndVerify`,
+  `TestTrustStoreConflictingCert` and `TestRemoveNonExistent` use
+  `LocalMachine\Root` directly and are not elevation-gated;
+  `TestTrustStoreEmptyDER` and `TestPlatformTrustStoreReturnsStore` open the
+  real platform trust store.
+
+The **safe suite** — non-privileged, without machine CNG lifecycle or
+`LocalMachine\Root` access — excludes all six:
 
 ```text
-go test ./... -skip '^(TestTrustStoreInstallAndVerify|TestTrustStoreConflictingCert|TestRemoveNonExistent|TestCleanupLifecycleElevated)$'
+go test ./... -skip '^(TestTrustStoreInstallAndVerify|TestTrustStoreConflictingCert|TestRemoveNonExistent|TestCleanupLifecycleElevated|TestTrustStoreEmptyDER|TestPlatformTrustStoreReturnsStore)$'
 ```
+
+Report results of the safe suite and of the machine tests separately; do not
+describe a run of the full suite as green.
 
 Elevated Windows validation for the CNG / trust-store / cleanup lifecycle runs
 from an elevated shell on a disposable Windows environment:
@@ -775,6 +1019,49 @@ flows requiring elevation, machine CNG state, and `LocalMachine\Root` mutation
 are reported **NOT EXECUTED** in unprivileged environments and must be validated
 manually on a disposable Windows environment.
 
+The key access policies, the role separation and the key-ACL migration are
+covered offline by fake-based and structural tests (`TestKeyPolicy*`,
+`TestProductionKeyOperations*`, `TestAgentRole*`, `TestCARolePathsFailClosed`,
+`TestLegacyServingCompatibleBeforeMigration`, `TestMigrateKeyPolicies*`,
+`TestProductionCodeAvoidsLegacyPolicyFreeCNG`), which touch no real key, ACL or
+trust store.
+
+### Windows validation of the key policies
+
+The v0.3.0 key policies were validated once on a disposable Windows 11 VM with
+real tokens (elevated Administrator, UAC-filtered Administrator, LocalSystem
+and a real LOCAL SERVICE token obtained through a temporary scheduled task) and
+the real Microsoft Software KSP, using test-only key names and a test state
+directory. Observed: CA privileged-only and server service-signer DACLs on a
+fresh install; LOCAL SERVICE serves and signs with the server key and cannot
+open the CA key; `ReloadMachine`, `StageServerRenewal` and the migration are
+denied to non-privileged callers; a legacy DACL is recognized and migrated
+tighten-only and idempotently, with key names, public keys, certificate DER and
+CA fingerprint unchanged; negative cases fail closed; the staged renewal
+completes end to end with a real non-resumed handshake; cleanup restores the
+baseline. The harness is not part of this repository.
+
+Limits of that validation (accepted or to be closed before a release is
+declared validated):
+
+- The exported wrappers (`ProvisionMachine`, `LoadServingMaterial`,
+  `MigrateMachineKeyPolicies`, …) were **not** called directly, because they
+  are bound to the production key names and `%ProgramData%\Keppin`; the harness
+  ran the same internal bodies with test names and paths. Production names,
+  paths and deployment ACLs were therefore not exercised.
+- The legacy state was reproduced with the legacy `windowscng` API, not by an
+  installation made with a released v0.2.x binary; no real v0.2.x → v0.3.0
+  upgrade or v0.3.0 → v0.2.x downgrade was run.
+- Renewal timing was injected rather than waited for; LOCAL SERVICE came from
+  a scheduled task, not a Service Control Manager service.
+- The test helpers keep their legacy DACL (see
+  [Lower-level seam and testing APIs](#lower-level-seam-and-testing-apis)).
+- Test and production CAs share the CN `Keppin Local Root CA`: a leftover test
+  anchor in `LocalMachine\Root` makes `VerifyTrust` report `TrustConflict` for
+  another CA with the same CN. Clean up test anchors by exact fingerprint.
+- `TestCleanupLifecycleElevated` remains a known FAIL under a UAC-filtered token
+  (see above).
+
 ## Limitations
 
 - **Windows-only** for production machine flows.
@@ -788,6 +1075,15 @@ manually on a disposable Windows environment.
 - Trust-conflict resolution is **manual** — the module never auto-removes a
   conflicting anchor.
 - The single-writer contract is not enforced by the module.
+- **No per-service key isolation** — the server key is usable by every LOCAL
+  SERVICE process, not only by the Agent.
+- **No filesystem ACL enforcement** — the TLS state directory ACLs are set by
+  the installer/updater.
+- **No implicit key-ACL migration** — a legacy CA key stays exposed to LOCAL
+  SERVICE until `MigrateMachineKeyPolicies` is run explicitly.
+- **Existing-state provisioning uses open-or-create** — acceptable only under
+  the single-writer contract; the open-only probe before it is not an atomic
+  guarantee.
 - The module does not provide a generic TLS/PKI or trust-store framework.
 
 ## Troubleshooting
@@ -796,20 +1092,150 @@ manually on a disposable Windows environment.
    explicit unsupported-platform errors.
 2. **Provisioning** — was `ProvisionMachine()` already run (elevated)? Serving
    startup requires previously persisted machine material.
-3. **Elevation** — provisioning and cleanup require Administrator; serving
-   startup and read-only verification do not, but the process must be able to
-   open the persisted server key.
-4. **Trust** — `TrustAbsent` / `TrustConflict` fails closed with
+3. **Privilege** — provisioning, `ReloadMachine`, staging, migration and
+   cleanup require LocalSystem or an elevated Administrator
+   (`ErrPrivilegeRequired`). Serving does not, but the process token must be
+   authorized by the server key DACL: LOCAL SERVICE is, a UAC-filtered
+   Administrator is not.
+4. **Key policy** — `ErrKeyPolicyMismatch` on the CA key after an upgrade from
+   v0.2.x means the key-ACL migration has not run; see
+   [Upgrading from v0.2.x to v0.3.0](#upgrading-from-v02x-to-v030). On any other
+   key or DACL, inspect manually; never widen a DACL to make an open succeed.
+5. **Trust** — `TrustAbsent` / `TrustConflict` fails closed with
    `ErrTrustNotHealthy`; re-running `ProvisionMachine` does not repair it. See
    [Trust states and recovery](#trust-states-and-recovery). Do not weaken trust
    checks and do not auto-remove a conflicting anchor.
-5. **Inconsistent state** — `ErrInconsistentMachineState` is never resolved
+6. **Inconsistent state** — `ErrInconsistentMachineState` is never resolved
    automatically; inspect the state directory and keys before any cleanup.
-6. **Renewal** — `ErrRenewalDue` means "run the staged renewal flow". A
+7. **Renewal** — `ErrRenewalDue` means "run the staged renewal flow". A
    successful `ProvisionMachine` does not mean the certificate was renewed. An
    expired certificate fails closed in `LoadServingMaterial` until a candidate is
    staged, activated, attested and confirmed.
-7. **Sentinels** — match with `errors.Is`, never on message text.
+8. **Sentinels** — match with `errors.Is`, never on message text.
+
+## Upgrading from v0.2.x to v0.3.0
+
+v0.3.0 is a **breaking** release. Under SemVer pre-1.0 (`0.y.z`) a breaking
+change is carried by a minor version, so the module path and major version are
+unchanged; v0.3.0 must not be treated as a drop-in patch of v0.2.x. The
+persisted identities (key names, directory and file names) are unchanged.
+Code that compiled against v0.2.x still compiles, but compiling is **not**
+evidence of operational compatibility: the privilege contract, the consumer
+call sites and the upgrade procedure change. v0.3.0 has no legacy mode and no
+compatibility switch.
+
+### Behavior changes
+
+| Area | v0.2.x | v0.3.0 |
+| --- | --- | --- |
+| CA key DACL | service-signer (LOCAL SERVICE read/execute) | privileged-only (`PolicyPrivilegedOnly`) on first install; legacy keys only after `MigrateMachineKeyPolicies` |
+| Server key DACL | service-signer | unchanged (`PolicyServiceSigner`), now verified exactly on every open |
+| Key opens | policy-free `windowscng` API | policy-aware `windowscng` API; a DACL other than the role policy fails with `ErrKeyPolicyMismatch` |
+| `ReloadMachine` | no elevation required; any principal authorized by the legacy DACL, LOCAL SERVICE included | **privileged only**; administrative full-state verification |
+| `StageServerRenewal` | no elevation required; any principal authorized by the legacy DACL, LOCAL SERVICE included | **privileged only** (renewal authority) |
+| `ProvisionMachine` on existing state | opened the keys under the legacy DACL | fails with `ErrKeyPolicyMismatch` on a legacy CA key until migrated |
+| `LoadServingMaterial`, `LoadServingCandidate` | opened the server key under the legacy DACL | unchanged for a server key principal; work on legacy installations before migration |
+| `ConfirmServingCandidate`, `AbandonServingCandidate` | preconditions not documented | unchanged; their caller and filesystem preconditions are now documented |
+| New API | — | `MigrateMachineKeyPolicies()`; sentinels `ErrKeyPolicyMismatch`, `ErrPrivilegeRequired` |
+| CNG dependency | `github.com/keppin-oss/cng v0.2.0` | `v0.2.1` (policy-aware API now used; `Sign`/`Close` synchronized; the first `Close` may report a handle-release error) |
+
+### Migrating call sites
+
+- **Non-privileged `ReloadMachine` callers** (for example the Agent's listener
+  reload) move to `LoadServingMaterial`. Do **not** elevate the runtime to keep
+  calling `ReloadMachine`. `LoadServingMaterial` does not report
+  `ErrRenewalDue`, so move renewal scheduling into separate consumer logic (see
+  [`ReloadMachine` and `LoadServingMaterial` are not interchangeable](#provisioning-flow)).
+- **`StageServerRenewal` callers** must run as LocalSystem or an elevated
+  Administrator. The consumer steps (`LoadServingCandidate`, activation,
+  attestation, `ConfirmServingCandidate` / `AbandonServingCandidate`) may stay
+  in the LOCAL SERVICE runtime, coordinated as described in
+  [Server-certificate renewal](#server-certificate-renewal).
+- **Error handling** adds `ErrPrivilegeRequired` and `ErrKeyPolicyMismatch`
+  (match with `errors.Is`). Neither is a reason to elevate a serving runtime,
+  widen a DACL, regenerate a key or clean up.
+- **Deployment** sets the TLS state directory ACLs described in
+  [Filesystem access](#filesystem-access); Local TLS does not.
+- Verify every consumer against this matrix before adopting v0.3.0.
+
+### Migrating key access policies
+
+Installations provisioned before v0.3.0 have a CA key whose DACL grants LOCAL
+SERVICE read/execute. **Installing the v0.3.0 library alone does not remove
+that exposure**: until the migration succeeds, any LOCAL SERVICE process can
+still open the CA key through the native CNG API. Do not declare an
+installation protected because the library was upgraded.
+
+**Owner: the privileged installer/updater**, as one serialized administrative
+upgrade step. Local TLS never migrates implicitly, and serving never runs the
+migration. Cutover procedure:
+
+1. Stop every process that uses Local TLS on the machine (the old Agent and any
+   older binary that may hold a CA key handle) and make sure no provisioning,
+   renewal attempt or cleanup is in progress. Rewriting the DACL denies new
+   opens; it is **not** assumed to revoke handles already open, so old
+   processes must have exited before the migration counts as effective.
+2. Deploy the v0.3.0 binaries.
+3. As LocalSystem or an elevated Administrator, call
+   `MigrateMachineKeyPolicies()` once:
+
+   ```go
+   if err := localtls.MigrateMachineKeyPolicies(); err != nil {
+      // fail closed: inspect the error; never regenerate keys or the CA,
+      // never widen a DACL
+   }
+   ```
+
+4. Optionally confirm the result with a privileged `ReloadMachine()` (it reports
+   `ErrRenewalDue` if a renewal is due).
+5. Restart the services and resume the normal lifecycle: serving through
+   `LoadServingMaterial`, renewal through the staged flow.
+
+`MigrateMachineKeyPolicies`:
+
+- requires LocalSystem or an elevated Administrators member
+  (`ErrPrivilegeRequired`, no key touched) and complete provisioned state, both
+  certificate DERs present (`ErrInconsistentMachineState`, no key touched);
+- verifies read-only that the server key opens under `PolicyServiceSigner` and
+  matches the server certificate; if not, the CA key is not touched; the server
+  DACL is never rewritten;
+- rewrites the CA key DACL in place from the exact service-signer form to
+  privileged-only, with read-back on the open handle and on a fresh handle; a CA
+  key that is already privileged-only is left untouched, so repeated runs are
+  no-ops;
+- verifies that the CA key opens under `PolicyPrivilegedOnly`, matches the CA
+  certificate, and that the CA certificate DER is unchanged.
+
+It never creates, regenerates, rotates or deletes a key, never writes a
+certificate and never reads or modifies `LocalMachine\Root`; key names, public
+keys, certificate DER and the CA fingerprint are preserved. Any other DACL fails
+closed with `ErrKeyPolicyMismatch` without a write; `ErrKeyNotFound` is reported
+as a failure, never as absence, and nothing is created.
+
+Failures and partial state:
+
+- **Before the DACL write** (privilege, incomplete or unreadable state, server
+  key check, unexpected CA DACL, CA key not opening): nothing has changed. Fix
+  the cause and run the migration again.
+- **After the DACL write** (read-back or final verification fails): the CA key
+  may already be privileged-only while the migration reports an error. There is
+  **no rollback**, because rolling back would widen access. Inspect
+  administratively and re-run the migration, which is a no-op on an already
+  tightened key and then repeats the verification. Never regenerate the CA or
+  restore the legacy DACL.
+- **Between deploy and migration** the installation is in a transitional state:
+  serving works; `ProvisionMachine`, `ReloadMachine` and `StageServerRenewal`
+  fail with `ErrKeyPolicyMismatch`; the CA key is still exposed. Keep this
+  window inside the upgrade step and do not report the mitigation as complete
+  during it.
+
+Downgrade: the migration is never reverted, so the v0.2.x contract does not come
+back with v0.2.x binaries. After migration, v0.2.x binaries can no longer open
+the CA key (their policy-free open accepts only the service-signer DACL):
+operations that need the CA, such as `ReloadMachine` and renewal, fail closed,
+while serving with the unchanged server key is expected to keep working. This
+behavior follows from the DACL check and has not been verified with a released
+v0.2.x binary.
 
 ## Upgrading from v0.1.x
 

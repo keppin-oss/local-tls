@@ -15,6 +15,22 @@ import (
 // its message.
 var ErrKeyNotFound = errors.New("persisted CNG key not found or not accessible")
 
+// ErrKeyPolicyMismatch indicates that a persisted Local-TLS key exists but its
+// DACL is not exactly the one required for its role: the CA key must be
+// privileged-only (SYSTEM and Administrators) and the server key must be the
+// service-signer DACL (SYSTEM, Administrators, LOCAL SERVICE read/execute). The
+// key was not modified. A CA key provisioned by an earlier release still
+// carries the service-signer DACL and fails this way until an elevated caller
+// runs MigrateMachineKeyPolicies; Local-TLS never migrates a key implicitly.
+var ErrKeyPolicyMismatch = errors.New("persisted CNG key DACL does not match its Local-TLS key policy")
+
+// ErrPrivilegeRequired indicates that the operation needs a caller running as
+// LocalSystem or as an elevated member of BUILTIN\Administrators, and the caller
+// is not one or its privilege could not be determined. Opening or creating the
+// CA key, and MigrateMachineKeyPolicies, require such a caller. No key was
+// opened, created or modified on that basis.
+var ErrPrivilegeRequired = errors.New("operation requires a privileged caller (LocalSystem or elevated Administrators)")
+
 // MachineKeyStore provides machine-scoped persistent signing keys.
 // On Windows this is backed by CNG/KSP; on other platforms it is unsupported.
 //
