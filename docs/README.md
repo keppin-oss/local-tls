@@ -9,7 +9,9 @@ Every claim in this document is traceable to the source, the tests, the build
 tags, or `go.mod`. Where a behavior is not demonstrable from this repository, it
 is labeled explicitly.
 
-This document describes **v0.3.0**. Upgrading from v0.2.x? Read
+This document describes **v0.3.1**. Upgrading from v0.3.0? See
+[Upgrading from v0.3.0 to v0.3.1](#upgrading-from-v030-to-v031): no API change
+and no migration step. Upgrading from v0.2.x? Read
 [Upgrading from v0.2.x to v0.3.0](#upgrading-from-v02x-to-v030) first: v0.3.0
 changes who may call several entry points and requires an explicit, privileged
 key-ACL migration on existing installations. Upgrading from v0.1.x? Also read
@@ -126,7 +128,7 @@ trust-store framework.
 ### Dependencies
 
 ```
-github.com/keppin-oss/cng v0.2.1      // windowscng — CNG/KSP key custody
+github.com/keppin-oss/cng v0.2.2      // windowscng — CNG/KSP key custody
 golang.org/x/sys        v0.47.0       // Windows syscall bindings
 ```
 
@@ -469,6 +471,19 @@ SERVICE included) and accepts only that form. They therefore do
 **not** follow the production key access policies: a smoke CA key is not
 privileged-only, as the source comment of `TestCreateKey` also states.
 Their name prefix check keeps them away from the production key names.
+
+The manual CLI `cmd/verify` wraps these helpers. Its `-open` operation reports
+one of three outcomes, with exit codes that are the CLI's own contract (not
+Windows codes): `OPENED` (0, the open succeeded), `NOT_OPENABLE` (3, the error
+matches the structured `ErrKeyNotFound` sentinel) and `ERROR` (1, any other
+failure, explicit native denials included; the original error is printed, with
+the HRESULT when present). The classification never parses error text. The
+Microsoft Software KSP reports NTE_BAD_KEYSET (`0x80090016`) both for an absent
+key and for a key whose DACL does not grant the caller (see [Errors](#errors)),
+so `NOT_OPENABLE` alone does **not** prove denial: it is interpreted only
+against a successful open of the same exact name by another principal in the
+same run. The CLI does not judge the outcome: which result is expected for each
+principal is defined by whoever runs the check.
 
 ## Provisioning flow
 
@@ -924,18 +939,54 @@ historical anchors.
   handle it opens on error paths (verified).
 - After a successful return, the caller owns the serving signer and must call
   `Close()` (caller responsibility).
-- The CA signer is a transient internal handle used only for issuer/renewal
-  signing; it is never transferred to the caller and is released internally.
+- The CA signer is a transient internal handle, used for issuer/renewal signing
+  and to verify that the persisted CA certificate matches the CA key (reload,
+  existing-state provisioning, staging and `MigrateMachineKeyPolicies`). It is
+  never transferred to the caller and is released internally.
 - `Close()` releases the process-local CNG handle only. It never deletes a
   persisted key, never removes certificates or trust anchors, and never triggers
   cleanup (verified).
 - `Close()` is idempotent in effect (verified). After `Close()`, the serving
   certificate must not be used for new handshakes.
-- With `github.com/keppin-oss/cng v0.2.1`, the first `Close()` may return an
-  error if a native handle cannot be released; the release is not retried, and
-  repeated calls are harmless and return `nil`. The CNG signer serializes `Sign`
-  and `Close`, but `Close()` does not drain callers: close a `Material` only
-  when no handshake can use it any longer.
+- With `github.com/keppin-oss/cng` v0.2.1 and later (this module requires
+  v0.2.2), the first `Close()` may return an error if a native handle cannot be
+  released; the release is not retried, and repeated calls are harmless and
+  return `nil`. The CNG signer serializes `Sign` and `Close`, but `Close()` does
+  not drain callers: close a `Material` only when no handshake can use it any
+  longer.
+- Since `github.com/keppin-oss/cng` v0.2.2, when a key open-or-create call
+  creates a **new** key and then fails to verify it or to build its signer
+  (public-key export), the CNG layer attempts once to delete that new key,
+  through the handle it created, instead of leaving it behind. If that deletion
+  fails, the CNG error also matches `windowscng.ErrCleanupFailed`. These error
+  paths never delete existing keys or keys that are only opened.
+  - Within Local TLS, open-or-create is reached through the `MachineKeyStore`
+    seam by `ProvisionMachine` first install (the intended creation path) and
+    by `ProvisionWithKeyStore`, including its existing-state verification,
+    which can create a missing key name as a side effect (see
+    [Provisioning flow](#provisioning-flow)). The test helper `TestCreateKey`
+    calls `windowscng.LoadOrCreate` directly, outside that seam. The runtime
+    and renewal paths open existing keys only.
+  - The rollback covers only the key created by that call: a CA key created
+    earlier in the same provisioning is not removed (see the first-install
+    limits in [Provisioning flow](#provisioning-flow)).
+  - Local TLS maps the CNG errors before returning them. `ErrCleanupFailed`
+    stays matchable with `errors.Is` when the error is classified as
+    `ErrKeyPolicyMismatch` or `ErrPrivilegeRequired`, or passed through
+    unchanged. An error classified as `ErrKeyNotFound` keeps the original
+    error as text only, so a chain carrying both `windowscng.ErrKeyNotFound`
+    and `ErrCleanupFailed` would lose the latter for `errors.Is`. The native
+    cng v0.2.2 rollback paths used by the production key store do not produce
+    that combination. The limit applies only to an error that actually goes
+    through `mapCNGError`, such as a synthetic error injected through the
+    internal CNG seam in tests or an adapter that calls the mapper; errors of
+    a custom `MachineKeyStore` are propagated as returned, not mapped. A future
+    cng version may need re-evaluation.
+  - Public-key export errors instead of panicking when the provider reports a
+    zero query size, zero bytes written, or more bytes written than the
+    buffer holds, and when the written blob is invalid or truncated. A valid
+    blob shorter than the queried size is accepted.
+  - None of these behaviors has been validated against a live KSP.
 - `Material` is single-owner; do not copy it by value and reuse the copy after
   `Close`.
 
@@ -983,24 +1034,33 @@ go test ./...
 On non-Windows, the Windows-specific tests are excluded by build tags. On
 Windows, `go test ./...` is **not** a safe, all-green suite:
 
-- `TestCleanupLifecycleElevated` is skipped only when elevation is clearly
-  unavailable. Under a UAC-filtered (non-elevated) Administrator token its
-  elevation probe is ambiguous (the probe key cannot be finalized and its
+- `TestCleanupLifecycleElevated` is skipped only when `KEPPIN_SMOKE_DIAG_DIR`
+  is not set to an existing directory or elevation is clearly unavailable.
+  With the directory set, under a UAC-filtered (non-elevated) Administrator
+  token its elevation probe is ambiguous (the probe key cannot be finalized and its
   rollback delete reports "not found"), so the test fails closed and is reported
   as **FAIL**, not SKIP. This is a known result, not a v0.3.0 regression and
   not masked as a skip. Each such run attempts to create a
   `Keppin.Test.Smoke.elevation-probe-*` key.
 - The trust-store tests `TestTrustStoreInstallAndVerify`,
   `TestTrustStoreConflictingCert` and `TestRemoveNonExistent` use
-  `LocalMachine\Root` directly and are not elevation-gated;
-  `TestTrustStoreEmptyDER` and `TestPlatformTrustStoreReturnsStore` open the
-  real platform trust store.
+  `LocalMachine\Root` directly and are not elevation-gated.
+- `TestTrustStoreEmptyDER` and `TestPlatformTrustStoreReturnsStore` do **not**
+  open the real trust store: the platform constructor only returns a struct,
+  and empty input is rejected before `LocalMachine\Root` is opened. They are
+  excluded from the safe suite only as a precaution, because they exercise the
+  real `windowsTrustStore` type rather than a fake.
+- `TestServingCloseRaceElevated` (handshakes concurrent with `Material.Close`)
+  runs only when `KEPPIN_SERVING_CLOSE_DIAG_DIR` names an existing directory
+  and the caller is privileged; it then creates and deletes one
+  `Keppin.Test.ServingClose.*` key.
 
 The **safe suite** — non-privileged, without machine CNG lifecycle or
-`LocalMachine\Root` access — excludes all six:
+`LocalMachine\Root` access — excludes all seven (five with real machine effects,
+two as a precaution):
 
 ```text
-go test ./... -skip '^(TestTrustStoreInstallAndVerify|TestTrustStoreConflictingCert|TestRemoveNonExistent|TestCleanupLifecycleElevated|TestTrustStoreEmptyDER|TestPlatformTrustStoreReturnsStore)$'
+go test ./... -skip '^(TestTrustStoreInstallAndVerify|TestTrustStoreConflictingCert|TestRemoveNonExistent|TestCleanupLifecycleElevated|TestServingCloseRaceElevated|TestTrustStoreEmptyDER|TestPlatformTrustStoreReturnsStore)$'
 ```
 
 Report results of the safe suite and of the machine tests separately; do not
@@ -1012,6 +1072,35 @@ from an elevated shell on a disposable Windows environment:
 ```text
 go test -v ./... -run 'TestCleanupLifecycleElevated|TestTrustStore|TestRemoveNonExistent'
 ```
+
+`TestCleanupLifecycleElevated` runs only when `KEPPIN_SMOKE_DIAG_DIR` names an
+existing directory outside the test temporary directory; otherwise it is
+skipped (NOT EXECUTED) before any machine operation. When a run does not
+complete, the test writes there, and to the test log, the exact key names, the
+CA SHA-256 and DER when recovered, and the outcome of every cleanup step. It
+releases the serving signer before deleting any key. If that release fails, it
+deletes no key, attempts only the removal of the exact CA trust anchor, fails,
+and does not start another cycle; the remaining keys are left for an
+authorized manual recovery after the test process exits. A failed cleanup step
+is reported, never retried automatically.
+
+`TestServingCloseRaceElevated` is the live serving-close harness. With a
+real CNG test key and an in-memory CA (no `LocalMachine\Root`, no TLS file) it
+runs a consumer-drain scenario, a deterministic race (a handshake held before
+signing while `Material.Close` runs and returns) and stress rounds over
+`net.Pipe`. A wrapper numbers every Sign and Close; a pure verifier classifies
+the windows it observes and never parses error text: a Sign called after the
+first Close returned must fail, a successful handshake must verify hostname,
+chain to the in-memory CA, leaf fingerprint and no resumption, and every failed
+handshake must have a failed Sign of its own overlapping or following the
+Close. It does not observe a native `NCryptSignHash` in progress, the number of
+native frees or native races. The key name is written to the diagnostics
+directory before creation. The key is deleted once, by exact name, only when
+every handle's first Close returned nil, every scenario reached quiescence, no
+panic occurred and every reopened handle matched the public key of the created
+key; otherwise it is kept for an authorized recovery. The
+verifier, the scenarios with an in-memory fake signer and the cleanup decisions
+are covered offline by `TestServingCloseHarness*`.
 
 The renewal protocol, its fault injection and retries, and a fake consumer with
 an in-memory TLS handshake run offline and unprivileged with `go test`. Live
@@ -1061,6 +1150,36 @@ declared validated):
   another CA with the same CN. Clean up test anchors by exact fingerprint.
 - `TestCleanupLifecycleElevated` remains a known FAIL under a UAC-filtered token
   (see above).
+
+### Windows validation of v0.3.1
+
+Before publication, the code of this release was run once on a disposable
+Windows 11 VM with the real Microsoft Software KSP and test-only key names. The
+binaries were built from the pre-publication tree; afterwards the module path,
+the serving-close harness identifiers (test names, environment variable,
+key-name prefix, diagnostics file name) and its log texts were changed for
+publication. The published tree passes the offline suite; it was not re-run
+live. Observed:
+
+- `cmd/verify -open` on a test key created by an elevated Administrator: a
+  second elevated Administrator opens and deletes it (the key DACL grants the
+  Administrators group, not the creating account); a standard user gets
+  `NOT_OPENABLE` (exit 3); LOCAL SERVICE signs with it.
+- `TestCleanupLifecycleElevated`, elevated: two complete cycles, PASS; the KSP
+  key inventory and `LocalMachine\Root` are identical before and after. Under a
+  UAC-filtered Administrator token it fails as documented above (the probe key
+  cannot be finalized, `NCryptFinalizeKey` returns NTE_PERM, and the rollback
+  delete reports "not found"), and no probe key remains.
+- `TestServingCloseRaceElevated`, elevated, built with `-race`: every scenario
+  passes (consumer drain, deterministic race on TLS 1.2 and TLS 1.3, 20 stress
+  rounds) with no data race reported; the wrapper observed Sign calls
+  overlapping `Material.Close` in 6 of the 20 stress rounds; the key is deleted
+  by exact name; the KSP key inventory and `LocalMachine\Root` are unchanged.
+
+Limits: production key names, paths and deployment ACLs were not exercised;
+overlaps are observed by the harness wrapper, not inside the native signer;
+`-race` covers Go state only; the cng v0.2.2 new-key rollback and export guard
+were not triggered live.
 
 ## Limitations
 
@@ -1112,6 +1231,31 @@ declared validated):
    expired certificate fails closed in `LoadServingMaterial` until a candidate is
    staged, activated, attested and confirmed.
 8. **Sentinels** — match with `errors.Is`, never on message text.
+
+## Upgrading from v0.3.0 to v0.3.1
+
+v0.3.1 is a patch release. There is no API change and no migration step;
+library behavior changes only on error paths, through cng v0.2.2.
+
+- **Dependency.** The module requires `github.com/keppin-oss/cng` v0.2.2:
+  `go get github.com/keppin-oss/local-tls@v0.3.1` updates it. v0.2.2 rolls back
+  a key that an open-or-create call newly created and then could not verify,
+  and returns errors instead of panicking on invalid public-key export results
+  (see [Lifecycle & ownership of `Material`](#lifecycle--ownership-of-material)).
+- **`cmd/verify -open`** (manual testing CLI) reports `OPENED` (exit 0),
+  `NOT_OPENABLE` (exit 3) or `ERROR` (exit 1), classified only through the
+  `ErrKeyNotFound` sentinel (see
+  [Lower-level seam and testing APIs](#lower-level-seam-and-testing-apis)).
+  **Exit codes changed meaning:** in v0.3.0 exit 0 meant that the open was
+  denied, as recognized from the error text, and exit 1 covered everything
+  else, a successful open included. In v0.3.1 exit 0 means that the open
+  succeeded, exit 3 that the key is absent or not accessible, and exit 1 any
+  other failure. The `DENIED` output is gone. Scripts that check the exit code
+  or parse the output must be updated.
+- **Tests.** `TestCleanupLifecycleElevated` now requires
+  `KEPPIN_SMOKE_DIAG_DIR` and is otherwise skipped (NOT EXECUTED); the new live
+  test `TestServingCloseRaceElevated` joins the exclusions of the safe suite
+  (see [Validation](#validation)).
 
 ## Upgrading from v0.2.x to v0.3.0
 

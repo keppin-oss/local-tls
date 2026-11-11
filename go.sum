@@ -1,4 +1,4 @@
-github.com/keppin-oss/cng v0.2.1 h1:/iuSDfjVb7Ba1Sh6zDD0O5lpTy+OFLQu87dFJi5Ko4g=
-github.com/keppin-oss/cng v0.2.1/go.mod h1:ilaWdGE9P+DQgEWR2EbhX5i7UdBWpSPv9WR1vg42hm0=
+github.com/keppin-oss/cng v0.2.2 h1:yl74SPt9m+b/5tTcQz3qhIF2Lhf/zOZjy6seYA4wxc0=
+github.com/keppin-oss/cng v0.2.2/go.mod h1:ilaWdGE9P+DQgEWR2EbhX5i7UdBWpSPv9WR1vg42hm0=
 golang.org/x/sys v0.47.0 h1:o7XGOvZQCADBQQ4Y7VNq2dRWQR7JmOUW8Kxx4ZsNgWs=
 golang.org/x/sys v0.47.0/go.mod h1:4GL1E5IUh+htKOUEOaiffhrAeqysfVGipDYzABqnCmw=

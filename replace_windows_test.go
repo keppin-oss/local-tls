@@ -130,7 +130,8 @@ func TestConfirmWhileServingReaderHoldsCertificate(t *testing.T) {
 
 // TestRenewalPathsUseOpenOnlyKeys is a source check that the runtime and
 // renewal composition opens existing CNG keys only and never routes through
-// open-or-create; the CNG v0.2.0 calls themselves stay in keystore_windows.go.
+// open-or-create; the policy-aware windowscng calls themselves stay in
+// keystore_windows.go.
 func TestRenewalPathsUseOpenOnlyKeys(t *testing.T) {
 	src, err := os.ReadFile("composition_windows.go")
 	if err != nil {

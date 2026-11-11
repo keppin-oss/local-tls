@@ -11,6 +11,7 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -56,7 +57,16 @@ func printUsage() {
 
 CNG operations:
   -create   Create test key (requires elevated Administrator)
-  -open     Open test key as current principal (expected DENIED for ordinary users)
+  -open     Open test key as current principal and report the outcome
+            (exit codes are this CLI's contract, not Windows codes):
+              exit 0 OPENED        the open succeeded
+              exit 3 NOT_OPENABLE  absent or not accessible: the KSP reports
+                                   NTE_BAD_KEYSET 0x80090016 for both, so this
+                                   result alone does not prove denial
+              exit 1 ERROR         any other failure; the original error is
+                                   printed, with the HRESULT when present
+            The CLI does not judge the outcome: the expected result for each
+            principal is defined by whoever runs the check.
   -sign     Sign and verify a test message (run as NT AUTHORITY\LocalService)
   -delete   Delete the exact test key (requires elevated Administrator)
 
@@ -67,7 +77,9 @@ Trust store operations:
   -trust-is      <sha256hex> Check if fingerprint is trusted (non-elevated)
 
 Environment:
-  `+identity.EnvPrefix+`_VERIFY_KEY_NAME   Exact `+identity.TestKeyNamespace+`* key name for open/sign/delete.
+  `+identity.EnvPrefix+`_VERIFY_KEY_NAME   Exact `+identity.TestKeyNamespace+`* key name for create/open/sign/delete.
+                         Set it in every process of a run: without it, each
+                         invocation generates a different random name.
 `)
 }
 
@@ -109,24 +121,56 @@ func handleCreate() int {
 	return 0
 }
 
+// openOutcome is the result of opening a test key as the current principal:
+// the label printed by -open and its exit code. The exit codes are this CLI's
+// own contract, not Windows codes. Classification relies only on the
+// structured localtls.ErrKeyNotFound sentinel, never on error text.
+type openOutcome struct {
+	label string
+	exit  int
+}
+
+var (
+	// outcomeOpened: the open succeeded.
+	outcomeOpened = openOutcome{label: "OPENED", exit: 0}
+	// outcomeNotOpenable: the open failed with localtls.ErrKeyNotFound. The
+	// Microsoft Software KSP reports NTE_BAD_KEYSET (0x80090016) both for an
+	// absent key and for a key whose DACL does not grant the caller, so the
+	// two are indistinguishable.
+	outcomeNotOpenable = openOutcome{label: "NOT_OPENABLE", exit: 3}
+	// outcomeError: the open failed for any other reason, explicit native
+	// denials included.
+	outcomeError = openOutcome{label: "ERROR", exit: 1}
+)
+
+// classifyOpen maps the error of localtls.TestOpenKey to an outcome.
+func classifyOpen(err error) openOutcome {
+	switch {
+	case err == nil:
+		return outcomeOpened
+	case errors.Is(err, localtls.ErrKeyNotFound):
+		return outcomeNotOpenable
+	default:
+		return outcomeError
+	}
+}
+
 func handleOpen() int {
 	name := keyName()
 	fmt.Printf("OPEN %s\n", name)
 	signer, err := localtls.TestOpenKey(name)
-	if err != nil {
-		msg := err.Error()
-		if isAccessDenied(msg) {
-			fmt.Printf("DENIED (expected for ordinary user): %v\n", err)
-			fmt.Println("ACCESS_CHECK ordinary-user deny test PASSED")
-			return 0
-		}
-		fmt.Fprintf(os.Stderr, "ERROR: open failed (not access-denied): %v\n", err)
-		return 1
+	outcome := classifyOpen(err)
+	switch outcome {
+	case outcomeOpened:
+		defer closeSigner(signer)
+		fmt.Printf("OPENED key=%s pub=%T\n", name, signer.Public())
+	case outcomeNotOpenable:
+		fmt.Printf("NOT_OPENABLE key=%s (absent or not accessible; this result alone does not prove denial): %v\n", name, err)
+	default:
+		// The original error, including the native HRESULT when present.
+		fmt.Fprintf(os.Stderr, "ERROR: open failed: %v\n", err)
 	}
-	defer closeSigner(signer)
-	fmt.Printf("OK key=%s pub=%T\n", name, signer.Public())
-	fmt.Println("WARNING: open succeeded — caller has more access than expected for ordinary user")
-	return 1
+	return outcome.exit
 }
 
 func handleSign() int {
@@ -155,21 +199,6 @@ func handleDelete() int {
 	}
 	fmt.Printf("OK deleted %s\n", name)
 	return 0
-}
-
-func isAccessDenied(msg string) bool {
-	lower := strings.ToLower(msg)
-	for _, ind := range []string{
-		"access is denied",
-		"access denied",
-		"0x80090010", // NTE_PERM
-		"0x801f0005", // STATUS_ACCESS_DENIED
-	} {
-		if strings.Contains(lower, ind) {
-			return true
-		}
-	}
-	return false
 }
 
 // --- Trust store operations ---
