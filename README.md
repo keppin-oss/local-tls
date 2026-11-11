@@ -40,6 +40,9 @@ See [`examples/`](examples/):
 
 ## Upgrading
 
+- **From v0.3.0 to v0.3.1** — no API change and no migration step; the module
+  now requires `github.com/keppin-oss/cng` v0.2.2. See
+  [Upgrading from v0.3.0 to v0.3.1](docs/README.md#upgrading-from-v030-to-v031).
 - **From v0.2.x to v0.3.0** — breaking: `ReloadMachine` and
   `StageServerRenewal` now require a privileged caller, and existing
   installations need an explicit, privileged `MigrateMachineKeyPolicies()` run

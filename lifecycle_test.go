@@ -15,12 +15,14 @@ import (
 // fakeCloseSigner is a crypto.Signer backed by an in-memory ECDSA P-256 key
 // that also implements interface{ Close() error }, modeling the production CNG
 // signer's public lifecycle without touching machine state. It records whether
-// and how many times it was closed.
+// and how many times it was closed successfully (closeCount) and every Close
+// call, failed ones included (closeAttempts).
 type fakeCloseSigner struct {
-	key        *ecdsa.PrivateKey
-	closed     bool
-	closeCount int
-	closeErr   error
+	key           *ecdsa.PrivateKey
+	closed        bool
+	closeCount    int
+	closeAttempts int
+	closeErr      error
 }
 
 func newFakeCloseSigner() *fakeCloseSigner {
@@ -38,6 +40,7 @@ func (f *fakeCloseSigner) Sign(r io.Reader, digest []byte, opts crypto.SignerOpt
 }
 
 func (f *fakeCloseSigner) Close() error {
+	f.closeAttempts++
 	if f.closeErr != nil {
 		return f.closeErr
 	}
