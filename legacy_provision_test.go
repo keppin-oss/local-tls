@@ -27,22 +27,17 @@ const (
 	serverKeyFile = "server-key.enc"
 )
 
-// Protector encrypts and decrypts sensitive material.
-// The production implementation is coordinated with installer/service
-// architecture (ADR-0010). CNG/KSP is the preferred direction for
-// later Windows machine key storage.
+// Protector encrypts and decrypts sensitive material for the legacy test helpers.
+// Production machine key storage uses CNG/KSP instead.
 type Protector interface {
 	Protect(plaintext []byte) ([]byte, error)
 	Unprotect(ciphertext []byte) ([]byte, error)
 }
 
-// PlatformProtector returns the platform-appropriate Protector.
-// Machine-scoped key protection is not yet configured; the final
-// deployment mechanism is coordinated with installer/service architecture
-// (ADR-0010). This function returns an error until the machine key-store
-// strategy is approved and implemented.
+// PlatformProtector is retained only for legacy tests.
+// It always returns an error because no platform Protector is configured.
 func PlatformProtector() (Protector, error) {
-	return nil, fmt.Errorf("machine key protector not yet configured; see ADR-0010")
+	return nil, fmt.Errorf("machine key protector not yet configured")
 }
 
 func marshaledKey(key *ecdsa.PrivateKey) ([]byte, error) {

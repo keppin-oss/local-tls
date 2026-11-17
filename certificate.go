@@ -59,6 +59,17 @@ func createCACertSelfSigned(now time.Time, signer crypto.Signer) (*x509.Certific
 		MaxPathLen:            0,
 		MaxPathLenZero:        true,
 		KeyUsage:              x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+
+		// Name constraints (critical): the only names this CA ever issues for
+		// are the fixed leaf identities. They make verifiers that apply the
+		// anchor's constraints reject anything else; they do not stop a holder
+		// of the CA key from signing. The DNS constraint is a subtree, so it
+		// also admits names under localhost (for example foo.localhost); the
+		// exact SAN check lives in validateSAN.
+		PermittedDNSDomainsCritical: true,
+		PermittedDNSDomains:         []string{"localhost"},
+		PermittedIPRanges:           caPermittedIPRanges(),
 	}
 	certDER, err := x509.CreateCertificate(rand.Reader, template, template, signer.Public(), signer)
 	if err != nil {
@@ -69,6 +80,15 @@ func createCACertSelfSigned(now time.Time, signer crypto.Signer) (*x509.Certific
 		return nil, fmt.Errorf("parse CA certificate: %w", err)
 	}
 	return cert, nil
+}
+
+// caPermittedIPRanges returns the exact loopback ranges the CA may issue for:
+// 127.0.0.1/32 and ::1/128 (not 127.0.0.0/8).
+func caPermittedIPRanges() []*net.IPNet {
+	return []*net.IPNet{
+		{IP: net.IPv4(127, 0, 0, 1).To4(), Mask: net.CIDRMask(32, 32)},
+		{IP: net.IPv6loopback, Mask: net.CIDRMask(128, 128)},
+	}
 }
 
 // generateServerCertWithSigner creates a server certificate signed by the CA signer,
