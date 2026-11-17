@@ -40,6 +40,12 @@ See [`examples/`](examples/):
 
 ## Upgrading
 
+- **From v0.3.x to v0.4.0** — one new exported error, `ErrCANotConstrained`: the CA
+  is now issued with name constraints and a serverAuth-only EKU, and a CA from
+  v0.3.1 or earlier is rejected, fail-closed, until it is replaced with cleanup
+  and a new provisioning. The module requires `github.com/keppin-oss/cng`
+  v0.3.1. See
+  [Upgrading from v0.3.x to v0.4.0](docs/README.md#upgrading-from-v03x-to-v040).
 - **From v0.3.0 to v0.3.1** — no API change and no migration step; the module
   now requires `github.com/keppin-oss/cng` v0.2.2. See
   [Upgrading from v0.3.0 to v0.3.1](docs/README.md#upgrading-from-v030-to-v031).

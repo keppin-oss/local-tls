@@ -288,6 +288,82 @@ func TestMapCNGErrorPolicySentinels(t *testing.T) {
 	}
 }
 
+// TestMapCNGErrorTypedNativeErrors proves the typed native errors of cng v0.3.0
+// and later are passed through unchanged: a bare NCryptError is never promoted
+// to ErrKeyNotFound (even for the not-found/bad-keyset statuses, because only the
+// windowscng.ErrKeyNotFound sentinel classifies a key as not found or
+// inaccessible), nor to a policy or privilege sentinel, and stays reachable with
+// errors.As.
+func TestMapCNGErrorTypedNativeErrors(t *testing.T) {
+	for _, code := range []uint32{windowscng.NTEPerm, windowscng.NTEBadKeyset, windowscng.NTENotFound} {
+		native := &windowscng.NCryptError{Op: "NCryptOpenKey", Code: code}
+		err := mapCNGError(fmt.Errorf("key %q: %w", caKeyName, native))
+		var got *windowscng.NCryptError
+		if !errors.As(err, &got) || got.Code != code {
+			t.Fatalf("code 0x%x: native error lost in %v", code, err)
+		}
+		for _, s := range []error{ErrKeyNotFound, ErrKeyPolicyMismatch, ErrPrivilegeRequired} {
+			if errors.Is(err, s) {
+				t.Fatalf("code 0x%x: bare native error mapped to %v", code, s)
+			}
+		}
+	}
+}
+
+// TestMapCNGErrorPostWriteVerification proves ErrPostWriteVerification (public
+// since cng v0.3.0) is passed through unchanged: it is not turned into a
+// Local-TLS sentinel, so the persisted-but-unverified DACL state is never
+// reported as a mismatch, as a missing key or as a privilege problem.
+//
+// Scope: only the mapper is exercised, with NTE_PERM as the native cause; the
+// NTE_BAD_KEYSET/NTE_NOT_FOUND causes and the absence of any later signer,
+// create or retry in the callers are not covered here.
+func TestMapCNGErrorPostWriteVerification(t *testing.T) {
+	native := &windowscng.NCryptError{Op: "NCryptGetProperty(Security Descr)", Code: windowscng.NTEPerm}
+	cause := errors.Join(windowscng.ErrPostWriteVerification, native)
+	err := mapCNGError(fmt.Errorf("key %q: %w", caKeyName, cause))
+	if !errors.Is(err, windowscng.ErrPostWriteVerification) {
+		t.Fatalf("mapped %v lost ErrPostWriteVerification", err)
+	}
+	var got *windowscng.NCryptError
+	if !errors.As(err, &got) || got.Code != windowscng.NTEPerm {
+		t.Fatalf("mapped %v lost the native cause", err)
+	}
+	for _, s := range []error{ErrKeyNotFound, ErrKeyPolicyMismatch, ErrPrivilegeRequired} {
+		if errors.Is(err, s) {
+			t.Fatalf("post-write verification failure mapped to %v", s)
+		}
+	}
+}
+
+// TestMapCNGErrorUnavailableDescriptor proves a persisted-DACL read that CNG
+// v0.3.1 reports as unavailable (it no longer wraps ErrPolicyMismatch) stays an
+// unclassified error: it is not mapped to ErrKeyPolicyMismatch and, being
+// neither not-found nor a privilege problem, not to those sentinels either, so
+// the callers keep failing closed without treating it as a policy decision.
+//
+// Scope: the cause is a synthetic error carrying the expected message, so this
+// proves only the mapper's pass-through of an unclassified error. It does not
+// prove that a native 0-byte read yields that classification (covered by the
+// cng module's own tests) nor the behavior of the callers. A failure after the
+// DACL write is a different case, reported as ErrPostWriteVerification (see
+// TestMapCNGErrorPostWriteVerification).
+func TestMapCNGErrorUnavailableDescriptor(t *testing.T) {
+	cause := errors.New("read persisted DACL (descriptor unavailable): NCryptGetProperty(Security Descr): reported 0 bytes written")
+	err := mapCNGError(fmt.Errorf("key %q: %w", caKeyName, cause))
+	if err == nil {
+		t.Fatal("unavailable descriptor mapped to nil")
+	}
+	for _, s := range []error{ErrKeyNotFound, ErrKeyPolicyMismatch, ErrPrivilegeRequired} {
+		if errors.Is(err, s) {
+			t.Fatalf("unavailable descriptor mapped to %v", s)
+		}
+	}
+	if !errors.Is(err, cause) {
+		t.Fatalf("mapped %v lost the original error", err)
+	}
+}
+
 // TestNoMachineIdentityOrEnterpriseTLSIdentity proves no Machine Identity or
 // Enterprise-TLS key identity/policy leaks into Local-TLS.
 func TestNoMachineIdentityOrEnterpriseTLSIdentity(t *testing.T) {

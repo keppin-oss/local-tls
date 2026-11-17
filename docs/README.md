@@ -9,9 +9,9 @@ Every claim in this document is traceable to the source, the tests, the build
 tags, or `go.mod`. Where a behavior is not demonstrable from this repository, it
 is labeled explicitly.
 
-This document describes **v0.3.1**. Upgrading from v0.3.0? See
-[Upgrading from v0.3.0 to v0.3.1](#upgrading-from-v030-to-v031): no API change
-and no migration step. Upgrading from v0.2.x? Read
+This document describes **v0.4.0**. Upgrading from v0.3.x? See
+[Upgrading from v0.3.x to v0.4.0](#upgrading-from-v03x-to-v040): one new
+exported error, and existing CAs must be replaced. Upgrading from v0.2.x? Read
 [Upgrading from v0.2.x to v0.3.0](#upgrading-from-v02x-to-v030) first: v0.3.0
 changes who may call several entry points and requires an explicit, privileged
 key-ACL migration on existing installations. Upgrading from v0.1.x? Also read
@@ -128,7 +128,7 @@ trust-store framework.
 ### Dependencies
 
 ```
-github.com/keppin-oss/cng v0.2.2      // windowscng — CNG/KSP key custody
+github.com/keppin-oss/cng v0.3.1      // windowscng — CNG/KSP key custody
 golang.org/x/sys        v0.47.0       // Windows syscall bindings
 ```
 
@@ -241,6 +241,7 @@ context, and a single error can match more than one sentinel.
 var (
 	ErrCertificateNotValidNow   error // CA or leaf expired or not yet valid
 	ErrLeafOutlivesCA           error // leaf validity would extend beyond the CA
+	ErrCANotConstrained         error // CA lacks the required name constraints or EKU
 	ErrTrustNotHealthy          error // CA trust anchor absent or conflicting
 	ErrInconsistentMachineState error // partial or incoherent persisted state
 	ErrRenewalDue               error // run the staged renewal flow
@@ -738,7 +739,9 @@ Verified properties of the generated material:
 - CA and server keys are **ECDSA P-256**.
 - CA certificate is **self-signed**: `IsCA`, `BasicConstraintsValid`,
   `MaxPathLen=0` (`MaxPathLenZero=true`), key usage restricted to
-  `KeyUsageCertSign` only (no `CRLSign`, no `DigitalSignature`).
+  `KeyUsageCertSign` only (no `CRLSign`, no `DigitalSignature`), EKU exactly
+  `[serverAuth]`, and critical name constraints: permitted DNS `localhost` and
+  permitted IP ranges exactly `127.0.0.1/32` and `::1/128`.
 - Server certificate is signed by that CA; server-auth EKU only.
 - Server identity is strictly local: DNS SAN `localhost`; IP SANs `127.0.0.1`
   and `::1` (validated by `validateSAN`).
@@ -749,6 +752,25 @@ Verified properties of the generated material:
   decoupled from certificate renewal (verified).
 - The CA `MaxPathLen=0` constraint rejects subordinate-CA chains (verified by
   `TestSubordinateCAChainRejected`).
+- **CA name constraints and EKU.** `validateCA` rejects, fail-closed, a CA
+  that lacks the required constraints or EKU, or whose constraints or EKU are
+  not the ones above, with `ErrCANotConstrained` (distinct from
+  `ErrCertificateNotValidNow` and `ErrTrustNotHealthy`). A time-invalid CA is
+  reported as such first. This applies to every path that reaches the common
+  validator: serving, renewal staging, candidate load and confirm, and
+  provisioning on existing state. The provisioning pre-checks only verify the
+  presence and coherence of DERs and keys; after them, provisioning rejects the
+  CA through the common validator. Nothing is regenerated or rewritten; a CA issued by an earlier development build is replaced with
+  cleanup and a new provisioning. Limits of the constraints:
+  - they do not stop a holder of the CA key from signing; they make verifiers
+    that apply the anchor's constraints reject other names;
+  - the DNS constraint is a subtree, so `foo.localhost` is admitted by the
+    constraint alone; the exact SAN check is `validateSAN`;
+  - the subject DN is not covered by the constraints;
+  - Go applies them (verified offline); Schannel/CryptoAPI, .NET and browsers
+    are not validated yet and must not be assumed uniform;
+  - no defence against a compromised SYSTEM or administrator, who can also
+    change the trust store.
 
 Validity rules (policy; verified):
 
@@ -892,8 +914,8 @@ historical anchors.
 - `ErrRenewalDue`: `ReloadMachine` reports it as soon as the leaf is within
   `RenewalThreshold` of expiry; existing-state provisioning reports it only once
   the leaf has expired. Run the staged renewal flow.
-- `ErrCertificateNotValidNow`, `ErrLeafOutlivesCA` and `ErrTrustNotHealthy` are
-  fail-closed results of the common validator.
+- `ErrCertificateNotValidNow`, `ErrLeafOutlivesCA`, `ErrCANotConstrained` and
+  `ErrTrustNotHealthy` are fail-closed results of the common validator.
 - Renewal sentinels (`ErrNoCandidate`, `ErrCandidateNotFound`,
   `ErrCandidateMismatch`, `ErrCandidateStale`, `ErrCandidatePromoted`,
   `ErrPromotionUnconfirmed`) are described in
@@ -949,7 +971,7 @@ historical anchors.
 - `Close()` is idempotent in effect (verified). After `Close()`, the serving
   certificate must not be used for new handshakes.
 - With `github.com/keppin-oss/cng` v0.2.1 and later (this module requires
-  v0.2.2), the first `Close()` may return an error if a native handle cannot be
+  v0.3.1), the first `Close()` may return an error if a native handle cannot be
   released; the release is not retried, and repeated calls are harmless and
   return `nil`. The CNG signer serializes `Sign` and `Close`, but `Close()` does
   not drain callers: close a `Material` only when no handshake can use it any
@@ -976,12 +998,46 @@ historical anchors.
     unchanged. An error classified as `ErrKeyNotFound` keeps the original
     error as text only, so a chain carrying both `windowscng.ErrKeyNotFound`
     and `ErrCleanupFailed` would lose the latter for `errors.Is`. The native
-    cng v0.2.2 rollback paths used by the production key store do not produce
+    cng v0.2.2 rollback paths used by the production key store did not produce
     that combination. The limit applies only to an error that actually goes
     through `mapCNGError`, such as a synthetic error injected through the
     internal CNG seam in tests or an adapter that calls the mapper; errors of
     a custom `MachineKeyStore` are propagated as returned, not mapped. A future
-    cng version may need re-evaluation.
+    cng version may need re-evaluation; this was not re-verified against
+    v0.3.1.
+  - Since `github.com/keppin-oss/cng` v0.3.0, a **non-privileged** caller whose
+    `NCryptFinalizeKey` is denied with `NTE_PERM`, followed by a delete of the
+    never finalized key that reports `NTE_BAD_KEYSET`, no longer produces
+    `windowscng.ErrCleanupFailed`: the key was not persisted and the error is
+    the finalize denial alone. Every other combination, including the same
+    statuses for a privileged caller, still wraps `ErrCleanupFailed`. This was
+    verified natively by cng on a single configuration only (Windows NT
+    10.0.26200, Microsoft Software KSP); it has not been validated by
+    Local TLS against a live KSP.
+  - Since cng v0.3.0 the native failures are typed (`*windowscng.NCryptError`
+    with `Op` and `Code`, reachable with `errors.As`; `Op` is descriptive only
+    and must not be compared) and `windowscng.ErrPostWriteVerification` is
+    public. `mapCNGError` still classifies only by the cng sentinels:
+    a bare native error is never converted to `ErrKeyNotFound`, and an
+    error that matches `ErrPostWriteVerification` (a DACL was written but could
+    not be confirmed; nothing is rolled back) is passed through unchanged, so
+    callers must not retry or regenerate keys automatically after it.
+  - Since cng v0.3.1, a persisted security-descriptor read that reports 0 bytes
+    written, and an Export Policy read whose reported size is not exactly 4
+    bytes, fail closed: the key is not opened and no signer is returned. The
+    0-byte descriptor on the policy path no longer wraps
+    `windowscng.ErrPolicyMismatch`, so it is not reported as
+    `ErrKeyPolicyMismatch`; it is passed through as an unclassified error.
+    This applies to a read that fails before any DACL write. If the read fails
+    after the write, cng reports `windowscng.ErrPostWriteVerification`
+    instead (see the previous item): the DACL is persisted but unconfirmed and
+    nothing is rolled back.
+  - cng v0.3.1 states that provisioning and policy changes on the same key must
+    be serialized by the caller, also across processes, and that the package
+    does not guarantee tighten-only transitions with concurrent writers. This
+    reinforces the single-writer contract of `ProvisionMachine`,
+    `MigrateMachineKeyPolicies` and cleanup: one lifecycle coordinator per
+    machine must not run them concurrently.
   - Public-key export errors instead of panicking when the provider reports a
     zero query size, zero bytes written, or more bytes written than the
     buffer holds, and when the written blob is invalid or truncated. A valid
@@ -1231,6 +1287,33 @@ were not triggered live.
    expired certificate fails closed in `LoadServingMaterial` until a candidate is
    staged, activated, attested and confirmed.
 8. **Sentinels** — match with `errors.Is`, never on message text.
+
+## Upgrading from v0.3.x to v0.4.0
+
+v0.4.0 changes how the CA is issued and validated. There is one new exported
+identifier, `ErrCANotConstrained`, and existing installations need a
+replacement of the CA.
+
+- **CA template.** A CA issued by v0.4.0 carries critical name constraints
+  (permitted DNS `localhost`; permitted IP ranges exactly `127.0.0.1/32` and
+  `::1/128`) and the extended key usage `[serverAuth]`. See
+  [Certificate & key lifecycle](#certificate--key-lifecycle) for the limits of
+  these constraints.
+- **Existing CAs are rejected.** A CA issued by v0.3.1 or earlier has neither
+  the constraints nor the EKU. Every path that reaches the common validator
+  (serving, renewal staging, candidate load and confirm, provisioning on
+  existing state) fails closed with `ErrCANotConstrained`, which is distinct
+  from `ErrCertificateNotValidNow` and `ErrTrustNotHealthy`. Nothing is
+  regenerated or rewritten: replace the CA with cleanup and a new provisioning.
+  Callers that switch on the error sentinels of the load paths should handle
+  the new one.
+- **Dependency.** The module requires `github.com/keppin-oss/cng` v0.3.1:
+  `go get github.com/keppin-oss/local-tls@v0.4.0` updates it. cng v0.3.0 and
+  later report native failures as typed errors and add
+  `ErrPostWriteVerification`; v0.3.1 fails closed on an empty security
+  descriptor and on an Export Policy of unexpected size (see
+  [Lifecycle & ownership of `Material`](#lifecycle--ownership-of-material)).
+- **API.** No function, type or signature is removed or changed.
 
 ## Upgrading from v0.3.0 to v0.3.1
 

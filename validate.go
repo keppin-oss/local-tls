@@ -18,6 +18,13 @@ var (
 	// the leaf to fit and never renews or rotates the CA automatically.
 	ErrLeafOutlivesCA = errors.New("server certificate validity extends beyond the CA certificate")
 
+	// ErrCANotConstrained indicates a CA certificate that lacks the name
+	// constraints or the serverAuth-only EKU Local-TLS puts in every CA it
+	// issues. It is distinct from an expired CA and from an unhealthy trust
+	// anchor. Loading fails closed; the CA is never regenerated. Replace it
+	// with cleanup and a new provisioning.
+	ErrCANotConstrained = errors.New("CA certificate lacks the required name constraints or extended key usage")
+
 	// ErrTrustNotHealthy indicates that the CA trust anchor is not in the
 	// TrustHealthy state (absent or conflicting). Loading fails closed;
 	// manual resolution is required.
@@ -41,6 +48,43 @@ func validateCA(ca *x509.Certificate, now time.Time) error {
 	if now.Before(ca.NotBefore) || now.After(ca.NotAfter) {
 		return fmt.Errorf("%w: CA certificate valid %s to %s, now %s", ErrCertificateNotValidNow,
 			ca.NotBefore.UTC().Format(time.RFC3339), ca.NotAfter.UTC().Format(time.RFC3339), now.UTC().Format(time.RFC3339))
+	}
+	return validateCAConstraints(ca)
+}
+
+// validateCAConstraints requires the name constraints and the EKU that
+// createCACertSelfSigned emits: critical permitted DNS [localhost], permitted
+// IP ranges exactly 127.0.0.1/32 and ::1/128, and EKU exactly [serverAuth]. A
+// CA without them (for example one issued by an earlier development build) is
+// rejected fail-closed with ErrCANotConstrained; nothing is regenerated.
+func validateCAConstraints(ca *x509.Certificate) error {
+	if !ca.PermittedDNSDomainsCritical ||
+		len(ca.PermittedDNSDomains) != 1 || ca.PermittedDNSDomains[0] != "localhost" ||
+		len(ca.ExcludedDNSDomains) != 0 || len(ca.ExcludedIPRanges) != 0 ||
+		len(ca.PermittedEmailAddresses) != 0 || len(ca.PermittedURIDomains) != 0 ||
+		len(ca.ExcludedEmailAddresses) != 0 || len(ca.ExcludedURIDomains) != 0 {
+		return fmt.Errorf("%w: name constraints are missing, not critical or not exactly localhost, 127.0.0.1/32 and ::1/128", ErrCANotConstrained)
+	}
+	want := caPermittedIPRanges()
+	if len(ca.PermittedIPRanges) != len(want) {
+		return fmt.Errorf("%w: permitted IP ranges are not exactly 127.0.0.1/32 and ::1/128", ErrCANotConstrained)
+	}
+	// The ranges are compared as a set, independent of their order in the DER.
+	// With equal cardinality, each expected range matching exactly once also
+	// rules out duplicates and extra ranges.
+	for _, w := range want {
+		matches := 0
+		for _, got := range ca.PermittedIPRanges {
+			if got != nil && got.IP.Equal(w.IP) && got.Mask.String() == w.Mask.String() {
+				matches++
+			}
+		}
+		if matches != 1 {
+			return fmt.Errorf("%w: permitted IP ranges are not exactly 127.0.0.1/32 and ::1/128", ErrCANotConstrained)
+		}
+	}
+	if len(ca.ExtKeyUsage) != 1 || ca.ExtKeyUsage[0] != x509.ExtKeyUsageServerAuth || len(ca.UnknownExtKeyUsage) != 0 {
+		return fmt.Errorf("%w: CA extended key usage is not exactly [serverAuth]", ErrCANotConstrained)
 	}
 	return nil
 }
