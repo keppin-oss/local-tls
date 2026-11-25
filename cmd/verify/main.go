@@ -9,6 +9,7 @@ import (
 	"crypto"
 	"crypto/rand"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/pem"
 	"errors"
@@ -55,8 +56,10 @@ func run() int {
 func printUsage() {
 	fmt.Fprint(os.Stderr, `Usage: verify <operation>
 
-CNG operations:
-  -create   Create test key (requires elevated Administrator)
+CNG operations (test keys use the service-signer policy):
+  -create   Create a new test key (requires elevated Administrator). Fails if
+            a key already exists under the name. Prints the key's DER
+            SubjectPublicKeyInfo as SPKI=<base64>: record it, -delete needs it.
   -open     Open test key as current principal and report the outcome
             (exit codes are this CLI's contract, not Windows codes):
               exit 0 OPENED        the open succeeded
@@ -68,7 +71,10 @@ CNG operations:
             The CLI does not judge the outcome: the expected result for each
             principal is defined by whoever runs the check.
   -sign     Sign and verify a test message (run as NT AUTHORITY\LocalService)
-  -delete   Delete the exact test key (requires elevated Administrator)
+  -delete -spki <base64> | -spki-file <path>
+            Delete the exact test key (requires elevated Administrator), only
+            if its policy and public key match the SPKI recorded by -create.
+            Exactly one of the two flags; the file holds the base64 text.
 
 Trust store operations:
   -trust-install <pemfile>   Install CA cert into LocalMachine\Root (requires elevation)
@@ -116,7 +122,13 @@ func handleCreate() int {
 		return 1
 	}
 	defer closeSigner(signer)
+	spki, err := localtls.TestKeySPKI(signer)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: key %s was created but its SPKI could not be encoded; it cannot be deleted with -delete: %v\n", name, err)
+		return 1
+	}
 	fmt.Printf("OK key=%s pub=%T\n", name, signer.Public())
+	fmt.Printf("SPKI=%s\n", base64.StdEncoding.EncodeToString(spki))
 	fmt.Printf("EXPORT "+identity.EnvPrefix+"_VERIFY_KEY_NAME=%s\n", name)
 	return 0
 }
@@ -191,14 +203,52 @@ func handleSign() int {
 }
 
 func handleDelete() int {
+	spki, err := parseSPKIArgs(os.Args[2:], os.ReadFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: -delete: %v\n", err)
+		return 2
+	}
 	name := keyName()
 	fmt.Printf("DELETE %s\n", name)
-	if err := localtls.TestDeleteKey(name); err != nil {
+	if err := localtls.TestDeleteKey(name, spki); err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: delete failed: %v\n", err)
 		return 1
 	}
 	fmt.Printf("OK deleted %s\n", name)
 	return 0
+}
+
+// parseSPKIArgs reads the expected SPKI of -delete from exactly one of
+// "-spki <base64>" or "-spki-file <path>" (a file holding the base64 text). It
+// only decodes the value; the CNG layer rejects a malformed or non-canonical
+// SPKI before any native call. There is no fallback: without an SPKI nothing
+// is deleted.
+func parseSPKIArgs(args []string, readFile func(string) ([]byte, error)) ([]byte, error) {
+	if len(args) != 2 {
+		return nil, errors.New("requires exactly one of -spki <base64> or -spki-file <path>")
+	}
+	var text string
+	switch args[0] {
+	case "-spki":
+		text = args[1]
+	case "-spki-file":
+		data, err := readFile(args[1])
+		if err != nil {
+			return nil, fmt.Errorf("read SPKI file: %w", err)
+		}
+		text = string(data)
+	default:
+		return nil, fmt.Errorf("unknown flag %q; requires -spki <base64> or -spki-file <path>", args[0])
+	}
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil, errors.New("the SPKI is empty")
+	}
+	spki, err := base64.StdEncoding.DecodeString(text)
+	if err != nil {
+		return nil, fmt.Errorf("the SPKI is not valid base64: %w", err)
+	}
+	return spki, nil
 }
 
 // --- Trust store operations ---

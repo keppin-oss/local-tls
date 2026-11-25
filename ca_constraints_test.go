@@ -408,7 +408,7 @@ func TestExistingStateProvisioningRejectsUnconstrainedCA(t *testing.T) {
 	if err := atomicWrite(filepath.Join(tlsDir, serverCertFile), leaf.Raw, 0600); err != nil {
 		t.Fatal(err)
 	}
-	ks := fakeMachineKeyStore{simulateExistingCA: true, simulateExistingServer: true, caSigner: caSigner, serverSigner: serverSigner}
+	ks := &fakeMachineKeyStore{simulateExistingCA: true, simulateExistingServer: true, caSigner: caSigner, serverSigner: serverSigner}
 	installs := 0
 	_, err = ProvisionWithKeyStore(dataDir, ks, countingTrustStore(&installs), fixedNow(caTestNow))
 	if !errors.Is(err, ErrCANotConstrained) {

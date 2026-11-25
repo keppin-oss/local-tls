@@ -229,21 +229,31 @@ func TestReloadValidityBoundaries(t *testing.T) {
 }
 
 // fixedKeyStore is a MachineKeyStore over existing in-memory keys. It counts
-// acquisitions; it never creates a different key.
+// opens; a create or a delete fails, so a test using it proves that the path
+// under test never creates or deletes a key.
 type fixedKeyStore struct {
 	ca, srv          crypto.Signer
 	caCalls, srCalls int
 }
 
-func (f *fixedKeyStore) LoadOrCreateCAKey() (crypto.Signer, error) {
+var errFixedKeyStoreMutation = errors.New("fixedKeyStore: unexpected key create or delete")
+
+func (f *fixedKeyStore) OpenCAKey() (crypto.Signer, error) {
 	f.caCalls++
 	return f.ca, nil
 }
 
-func (f *fixedKeyStore) LoadOrCreateServerKey() (crypto.Signer, error) {
+func (f *fixedKeyStore) OpenServerKey() (crypto.Signer, error) {
 	f.srCalls++
 	return f.srv, nil
 }
+
+func (f *fixedKeyStore) CreateCAKey() (crypto.Signer, error) { return nil, errFixedKeyStoreMutation }
+func (f *fixedKeyStore) CreateServerKey() (crypto.Signer, error) {
+	return nil, errFixedKeyStoreMutation
+}
+func (f *fixedKeyStore) DeleteCAKey([]byte) error     { return errFixedKeyStoreMutation }
+func (f *fixedKeyStore) DeleteServerKey([]byte) error { return errFixedKeyStoreMutation }
 
 // provisionDataDir copies the harness CA and server DERs into a fresh
 // ProvisionWithKeyStore data directory and returns it.

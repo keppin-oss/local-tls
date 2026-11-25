@@ -159,7 +159,7 @@ func TestProvisionPreCheckHealthyFirstInstallAndReload(t *testing.T) {
 	if err := provisionPreCheck(tlsDir, precheckCAKey, (&precheckProbe{err: ErrKeyNotFound}).probe, isPriv); err != nil {
 		t.Fatalf("first-install pre-check: %v", err)
 	}
-	ks := newFakeMachineKeyStore(true, true)
+	ks := newFakeMachineKeyStore(false, false)
 	m1, err := ProvisionWithKeyStore(dataDir, ks, okTrustStore(), fixedNow(now))
 	if err != nil {
 		t.Fatalf("first provision: %v", err)
@@ -187,7 +187,7 @@ func TestProvisionPreCheckBlocksCAReissueForExistingKey(t *testing.T) {
 	tlsDir := filepath.Join(dataDir, tlsSubDir)
 	now := time.Date(2026, 8, 8, 0, 0, 0, 0, time.UTC)
 
-	if _, err := ProvisionWithKeyStore(dataDir, newFakeMachineKeyStore(true, true), okTrustStore(), fixedNow(now)); err != nil {
+	if _, err := ProvisionWithKeyStore(dataDir, newFakeMachineKeyStore(false, false), okTrustStore(), fixedNow(now)); err != nil {
 		t.Fatalf("first provision: %v", err)
 	}
 	if err := os.Remove(filepath.Join(tlsDir, caCertFile)); err != nil {

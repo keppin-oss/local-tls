@@ -51,8 +51,9 @@ func (f *fakeCloseSigner) Close() error {
 	return nil
 }
 
-// closeTrackingKeyStore implements MachineKeyStore and MachineKeyDeleter using
-// fakeCloseSigners, recording any key deletions so tests can prove Close never
+// closeTrackingKeyStore implements MachineKeyStore using fakeCloseSigners: Open*
+// and Create* both return the same signer, so a first install and the later
+// reloads share it. It records any key deletions so tests can prove Close never
 // triggers deletion.
 type closeTrackingKeyStore struct {
 	caSigner     *fakeCloseSigner
@@ -61,20 +62,19 @@ type closeTrackingKeyStore struct {
 	deleteServer int
 }
 
-func (ks *closeTrackingKeyStore) LoadOrCreateCAKey() (crypto.Signer, error) {
-	return ks.caSigner, nil
-}
-
-func (ks *closeTrackingKeyStore) LoadOrCreateServerKey() (crypto.Signer, error) {
+func (ks *closeTrackingKeyStore) OpenCAKey() (crypto.Signer, error)     { return ks.caSigner, nil }
+func (ks *closeTrackingKeyStore) OpenServerKey() (crypto.Signer, error) { return ks.serverSigner, nil }
+func (ks *closeTrackingKeyStore) CreateCAKey() (crypto.Signer, error)   { return ks.caSigner, nil }
+func (ks *closeTrackingKeyStore) CreateServerKey() (crypto.Signer, error) {
 	return ks.serverSigner, nil
 }
 
-func (ks *closeTrackingKeyStore) DeleteCAKey() error {
+func (ks *closeTrackingKeyStore) DeleteCAKey([]byte) error {
 	ks.deleteCA++
 	return nil
 }
 
-func (ks *closeTrackingKeyStore) DeleteServerKey() error {
+func (ks *closeTrackingKeyStore) DeleteServerKey([]byte) error {
 	ks.deleteServer++
 	return nil
 }

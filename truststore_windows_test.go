@@ -9,10 +9,12 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"errors"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"math/big"
+	"os"
 	"testing"
 	"time"
 	"unsafe"
@@ -21,10 +23,46 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+// trustElevatedRequiredEnv, when set to "1", makes the tests that write
+// LocalMachine\Root fail instead of skipping when the caller is not privileged.
+// CI sets it on the elevated Windows runner, so a green job proves that the
+// elevated portions ran.
+const trustElevatedRequiredEnv = "KEPPIN_TRUST_ELEVATED_REQUIRED"
+
+// requireTrustStoreWriter decides, from the caller's token and before any
+// write, whether the elevated portion of a trust store test runs. A privileged
+// caller (LocalSystem or an elevated Administrators member) continues. Any
+// other caller skips, or fails when trustElevatedRequiredEnv is "1". An
+// InstallTrust failure is never a reason to skip: once this returns, the
+// writes must succeed.
+func requireTrustStoreWriter(t *testing.T) {
+	t.Helper()
+	privileged, err := callerIsPrivileged()
+	if err == nil && privileged {
+		return
+	}
+	if os.Getenv(trustElevatedRequiredEnv) == "1" {
+		t.Fatalf("%s=1 but the caller is not privileged (privileged=%v, err=%v)", trustElevatedRequiredEnv, privileged, err)
+	}
+	t.Skipf("LocalMachine\\Root writes require an elevated Administrator or LocalSystem (privileged=%v, err=%v) — NOT EXECUTED", privileged, err)
+}
+
+// removeTrustOnCleanup registers the removal of exactly der from
+// LocalMachine\Root at the end of the test, so a failing test does not leave
+// its certificate trusted. An already absent certificate is not an error.
+func removeTrustOnCleanup(t *testing.T, wts *windowsTrustStore, der []byte) {
+	t.Helper()
+	t.Cleanup(func() {
+		if err := wts.RemoveTrust(der); err != nil && !errors.Is(err, ErrTrustAnchorNotFound) {
+			t.Errorf("cleanup: remove test CA from LocalMachine\\Root: %v", err)
+		}
+	})
+}
+
 // TestTrustStoreInstallAndVerify tests the Windows trust adapter with
-// an ephemeral certificate. On a machine without elevation, InstallTrust
-// and RemoveTrust are expected to fail with an access-denied error.
-// VerifyTrust and IsTrustedSHA256 should work non-elevated.
+// an ephemeral certificate. VerifyTrust and IsTrustedSHA256 run for any
+// caller; install, idempotent install and removal run only for a privileged
+// caller (see requireTrustStoreWriter) and must then succeed.
 func TestTrustStoreInstallAndVerify(t *testing.T) {
 	store, err := platformTrustStore()
 	if err != nil {
@@ -54,13 +92,11 @@ func TestTrustStoreInstallAndVerify(t *testing.T) {
 		t.Log("Test CA already trusted — continuing")
 	}
 
-	err = wts.InstallTrust(cert.Raw)
-	if err != nil {
-		t.Logf("InstallTrust failed as non-admin (expected): %v", err)
-		t.Log("Skipping elevated-only portions: not running as administrator")
-		return
+	requireTrustStoreWriter(t)
+	removeTrustOnCleanup(t, wts, cert.Raw)
+	if err := wts.InstallTrust(cert.Raw); err != nil {
+		t.Fatalf("InstallTrust (privileged caller): %v", err)
 	}
-	t.Log("InstallTrust succeeded (running elevated)")
 
 	state, err = wts.VerifyTrust(cert.Raw)
 	if err != nil {
@@ -127,11 +163,11 @@ func TestTrustStoreConflictingCert(t *testing.T) {
 		t.Fatal("two generated certs have same fingerprint; test invalid")
 	}
 
-	err = wts.InstallTrust(cert1.Raw)
-	if err != nil {
-		t.Skipf("InstallTrust failed (not elevated): %v — skipping conflict test", err)
+	requireTrustStoreWriter(t)
+	removeTrustOnCleanup(t, wts, cert1.Raw)
+	if err := wts.InstallTrust(cert1.Raw); err != nil {
+		t.Fatalf("InstallTrust (privileged caller): %v", err)
 	}
-	defer func() { _ = wts.RemoveTrust(cert1.Raw) }()
 
 	state, err := wts.VerifyTrust(cert2.Raw)
 	if err != nil {

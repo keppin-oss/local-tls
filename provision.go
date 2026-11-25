@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -104,7 +105,7 @@ func provisionStateInconsistent(caDER, serverDER, caKey, serverKey bool) bool {
 // through StageServerRenewal and the consumer confirmation flow). An expired
 // leaf fails with ErrRenewalDue and ErrCertificateNotValidNow; any other
 // validation or trust failure returns a zero Material with a classified error.
-// Existing-state keys are acquired through keyStore (open-or-create).
+// Existing-state keys are opened through keyStore, never created.
 func ProvisionWithKeyStore(dataDir string, keyStore MachineKeyStore, trustStore TrustStore, now func() time.Time) (Material, error) {
 	if now == nil {
 		now = time.Now
@@ -137,75 +138,207 @@ func ProvisionWithKeyStore(dataDir string, keyStore MachineKeyStore, trustStore 
 	return reloadWithKeyStore(tlsDir, keyStore, trustStore, now)
 }
 
+// ErrRollbackIncomplete indicates that a first install failed and could not
+// undo everything it had created: a key it created may still persist, or a
+// certificate DER it wrote may still be on disk. The error also carries the
+// primary failure and, for each artifact left behind, the reason (for example
+// ErrKeyDeletionNotCompletable, ErrKeyNotFound or ErrDeleteVerificationFailed)
+// and the SHA-256 of the key's SubjectPublicKeyInfo when it is known, for an
+// authorized administrative recovery.
+var ErrRollbackIncomplete = errors.New("first install rollback incomplete")
+
+// ErrKeyReleaseUnconfirmed indicates that closing a key handle opened or
+// created by a first install reported an error: the release of that native
+// handle is not confirmed. It is never retried. It says nothing about whether
+// the persisted key exists; that is reported separately (for example by
+// ErrRollbackIncomplete).
+var ErrKeyReleaseUnconfirmed = errors.New("key handle release not confirmed")
+
+// releaseSigner closes one handle of the first install exactly once and
+// reports a failure as ErrKeyReleaseUnconfirmed with the key role.
+func releaseSigner(role string, s crypto.Signer) error {
+	if err := closeSigner(s); err != nil {
+		return fmt.Errorf("release the %s key handle: %w: %w", role, ErrKeyReleaseUnconfirmed, err)
+	}
+	return nil
+}
+
+// firstInstall records what one first install created, so that a failure
+// before both certificate DERs are persisted is compensated exactly: only the
+// keys this call created, identified by the SubjectPublicKeyInfo recorded right
+// after each Create, and only the DERs this call attempted to write (neither
+// existed before a first install). Nothing is ever deleted
+// by name alone, and a key is never reopened to learn its identity.
+type firstInstall struct {
+	keys MachineKeyDeleter
+
+	caCreated, serverCreated bool
+	caSPKI, serverSPKI       []byte // nil when the created key's SPKI could not be encoded
+	written                  []string
+}
+
+// recordSPKI encodes the SubjectPublicKeyInfo of a key this call just created.
+func recordSPKI(signer crypto.Signer) ([]byte, error) {
+	spki, err := x509.MarshalPKIXPublicKey(signer.Public())
+	if err != nil {
+		return nil, fmt.Errorf("encode the public key of the created key: %w", err)
+	}
+	return spki, nil
+}
+
+// rollback undoes the artifacts of a failed first install. The signers must be
+// closed before it runs. It removes the DERs this call wrote, newest first,
+// then deletes the server key and the CA key this call created, each through
+// its recorded SubjectPublicKeyInfo. Every step is attempted; it returns nil
+// only when everything was undone, otherwise an error wrapping
+// ErrRollbackIncomplete.
+func (fi *firstInstall) rollback() error {
+	var errs []error
+	for i := len(fi.written) - 1; i >= 0; i-- {
+		if err := os.Remove(fi.written[i]); err != nil && !errors.Is(err, os.ErrNotExist) {
+			errs = append(errs, fmt.Errorf("remove %s written by this install: %w", fi.written[i], err))
+		}
+	}
+	if fi.serverCreated {
+		if err := deleteCreatedKey("server", fi.serverSPKI, fi.keys.DeleteServerKey); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if fi.caCreated {
+		if err := deleteCreatedKey("CA", fi.caSPKI, fi.keys.DeleteCAKey); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if len(errs) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%w: %w", ErrRollbackIncomplete, errors.Join(errs...))
+}
+
+// deleteCreatedKey deletes one key created by the failed install through its
+// recorded SubjectPublicKeyInfo. Without it the key is left in place and
+// reported as ErrKeyDeletionNotCompletable.
+func deleteCreatedKey(role string, spki []byte, del func([]byte) error) error {
+	if spki == nil {
+		return fmt.Errorf("%s key created by this install: %w: its public key could not be encoded; the key may persist", role, ErrKeyDeletionNotCompletable)
+	}
+	if err := del(spki); err != nil {
+		return fmt.Errorf("delete %s key created by this install (SPKI SHA-256 %x): %w", role, sha256.Sum256(spki), err)
+	}
+	return nil
+}
+
+// firstProvisionWithKeyStore performs the first install: it creates both keys
+// (never opening or adopting an existing one), issues the CA and server
+// certificates, persists both DERs and installs the CA trust anchor.
+//
+// Until both DERs are persisted a failure is compensated (see
+// firstInstall.rollback): the error carries the primary cause, any handle
+// whose release failed (ErrKeyReleaseUnconfirmed) and, when the compensation
+// is incomplete, ErrRollbackIncomplete. A create that fails
+// leaves nothing this call owns: windowscng deletes the key of its own failed
+// create, or reports windowscng.ErrCleanupFailed when it could not, and that
+// key is not deleted again. After both DERs are persisted nothing is
+// compensated: a CA handle whose release is not confirmed
+// (ErrKeyReleaseUnconfirmed) stops the install before the trust anchor is
+// installed, and a failure to install the trust anchor is returned as is. The
+// keys and DERs then stay, a later ProvisionMachine fails closed with
+// ErrTrustNotHealthy, and CleanupMachine removes them with verified deletes.
 func firstProvisionWithKeyStore(tlsDir string, keyStore MachineKeyStore, trustStore TrustStore, now func() time.Time) (Material, error) {
 	if err := os.MkdirAll(tlsDir, 0700); err != nil {
 		return Material{}, fmt.Errorf("create tls directory: %w", err)
 	}
 
 	nowTime := now()
-
-	caSigner, err := keyStore.LoadOrCreateCAKey()
-	if err != nil {
-		return Material{}, fmt.Errorf("load or create CA key: %w", err)
+	fi := &firstInstall{keys: keyStore}
+	var caSigner, serverSigner crypto.Signer
+	fail := func(err error) (Material, error) {
+		// Release every handle before deleting the keys they were opened on.
+		// A failed release is reported, not retried; the rollback still deletes
+		// the keys this call created, each through its recorded identity, on a
+		// handle of its own.
+		errs := []error{err}
+		if serverSigner != nil {
+			errs = append(errs, releaseSigner("server", serverSigner))
+		}
+		if caSigner != nil {
+			errs = append(errs, releaseSigner("CA", caSigner))
+		}
+		errs = append(errs, fi.rollback())
+		return Material{}, errors.Join(errs...)
 	}
-	// The CA signer is a transient internal handle used only to sign the server
-	// certificate. It is never transferred to the caller, so release it on every
-	// exit path (success and error).
-	defer closeSigner(caSigner)
+
+	signer, err := keyStore.CreateCAKey()
+	if err != nil {
+		return Material{}, fmt.Errorf("create CA key: %w", err)
+	}
+	caSigner, fi.caCreated = signer, true
+	if fi.caSPKI, err = recordSPKI(caSigner); err != nil {
+		return fail(fmt.Errorf("record CA key identity: %w", err))
+	}
 
 	caCert, err := generateCAWithSigner(nowTime, caSigner)
 	if err != nil {
-		return Material{}, fmt.Errorf("generate CA certificate: %w", err)
+		return fail(fmt.Errorf("generate CA certificate: %w", err))
 	}
 
-	serverSigner, err := keyStore.LoadOrCreateServerKey()
+	signer, err = keyStore.CreateServerKey()
 	if err != nil {
-		return Material{}, fmt.Errorf("load or create server key: %w", err)
+		return fail(fmt.Errorf("create server key: %w", err))
 	}
-	// The server signer is transferred to the caller on success; release it only
-	// when construction fails part-way through.
-	keepServerSigner := false
-	defer func() {
-		if !keepServerSigner {
-			_ = closeSigner(serverSigner)
-		}
-	}()
+	serverSigner, fi.serverCreated = signer, true
+	if fi.serverSPKI, err = recordSPKI(serverSigner); err != nil {
+		return fail(fmt.Errorf("record server key identity: %w", err))
+	}
 
 	serverCert, err := generateServerCertWithSigner(nowTime, caCert, caSigner, serverSigner)
 	if err != nil {
-		return Material{}, fmt.Errorf("generate server certificate: %w", err)
+		return fail(fmt.Errorf("generate server certificate: %w", err))
 	}
 	// Bootstrap hardening: the generated pair must pass the common validator
 	// before anything is persisted or trusted.
 	if err := validateServerLeaf(serverCert, caCert, serverSigner.Public(), nowTime); err != nil {
-		return Material{}, fmt.Errorf("validate generated server certificate: %w", err)
+		return fail(fmt.Errorf("validate generated server certificate: %w", err))
 	}
 
-	if err := atomicWrite(filepath.Join(tlsDir, caCertFile), caCert.Raw, 0600); err != nil {
-		return Material{}, err
-	}
-	if err := atomicWrite(filepath.Join(tlsDir, serverCertFile), serverCert.Raw, 0600); err != nil {
-		return Material{}, err
+	// Each DER is recorded before it is written: a replace that reports an
+	// error may already have taken effect, and on a first install neither DER
+	// existed before, so the rollback removes whatever this call left.
+	for _, der := range []struct {
+		name string
+		raw  []byte
+	}{{caCertFile, caCert.Raw}, {serverCertFile, serverCert.Raw}} {
+		path := filepath.Join(tlsDir, der.name)
+		fi.written = append(fi.written, path)
+		if err := atomicWrite(path, der.raw, 0600); err != nil {
+			return fail(err)
+		}
 	}
 
+	// Both DERs are persisted: they are now the durable record of both key
+	// identities, and nothing below is compensated. The CA signer is a
+	// transient handle; the server signer is transferred on success. A CA
+	// handle whose release is not confirmed stops the install before the
+	// trust anchor is installed.
+	const notRolledBack = "the keys and certificates are persisted and are not rolled back; run CleanupMachine before a new first install"
+	if err := releaseSigner("CA", caSigner); err != nil {
+		return Material{}, errors.Join(fmt.Errorf("%w (%s)", err, notRolledBack), releaseSigner("server", serverSigner))
+	}
 	if err := trustStore.InstallTrust(caCert.Raw); err != nil {
-		return Material{}, fmt.Errorf("install CA in trust store: %w", err)
+		return Material{}, errors.Join(fmt.Errorf("install CA in trust store: %w (%s)", err, notRolledBack), releaseSigner("server", serverSigner))
 	}
 
-	keepServerSigner = true
 	return materialFromSigners(caCert, serverCert, serverSigner), nil
 }
 
 // reloadWithKeyStore verifies existing state through keyStore. It shares
 // reloadExisting with ReloadMachine (verifyExistingState policy) and never
-// renews or writes DER. Keys are acquired through MachineKeyStore, whose only
-// operations are open-or-create (documented in the README); the
-// renewal and runtime paths open existing keys only.
+// renews or writes DER. It opens the existing keys only and never creates one.
 func reloadWithKeyStore(tlsDir string, keyStore MachineKeyStore, trustStore TrustStore, now func() time.Time) (Material, error) {
 	return reloadExisting(machineEnv{
 		tlsDir:        tlsDir,
-		openCAKey:     keyStore.LoadOrCreateCAKey,
-		openServerKey: keyStore.LoadOrCreateServerKey,
+		openCAKey:     keyStore.OpenCAKey,
+		openServerKey: keyStore.OpenServerKey,
 		trust:         trustStore,
 		now:           now,
 		fs:            osFS,

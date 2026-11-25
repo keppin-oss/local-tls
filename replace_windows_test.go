@@ -129,9 +129,8 @@ func TestConfirmWhileServingReaderHoldsCertificate(t *testing.T) {
 }
 
 // TestRenewalPathsUseOpenOnlyKeys is a source check that the runtime and
-// renewal composition opens existing CNG keys only and never routes through
-// open-or-create; the policy-aware windowscng calls themselves stay in
-// keystore_windows.go.
+// renewal composition opens existing CNG keys only and never creates or
+// deletes one; the windowscng calls themselves stay in keystore_windows.go.
 func TestRenewalPathsUseOpenOnlyKeys(t *testing.T) {
 	src, err := os.ReadFile("composition_windows.go")
 	if err != nil {
@@ -144,15 +143,15 @@ func TestRenewalPathsUseOpenOnlyKeys(t *testing.T) {
 	if !strings.Contains(body, "openProductionKey(caKeyName)") || !strings.Contains(body, "openProductionKey(serverKeyName)") {
 		t.Fatal("productionEnv must open the CA and server keys with openProductionKey")
 	}
-	if strings.Contains(body, "LoadOrCreate") || strings.Contains(body, "loadOrCreateKey") {
-		t.Fatal("productionEnv must not create keys")
+	if strings.Contains(body, "createProductionKey") || strings.Contains(body, "deleteProductionKey") {
+		t.Fatal("productionEnv must not create or delete keys")
 	}
 	for _, f := range []string{"renewal.go", "validate.go", "fsops.go"} {
 		b, err := os.ReadFile(f)
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, forbidden := range []string{"windowscng", "LoadOrCreate", "InstallTrust", "Delete"} {
+		for _, forbidden := range []string{"windowscng", "CreateCAKey", "CreateServerKey", "InstallTrust", "Delete"} {
 			if strings.Contains(string(b), forbidden) {
 				t.Fatalf("%s must not reference %s", f, forbidden)
 			}

@@ -5,6 +5,7 @@ package localtls
 // outside t.TempDir.
 
 import (
+	"bytes"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -692,13 +693,22 @@ type fakeCCKeyOps struct {
 	createErr error
 	delErr    error
 	preflight *fakeCCSigner
+
+	// unencodable makes create return a signer whose public key cannot be
+	// encoded, so the run has no recorded identity to delete with.
+	unencodable bool
+	created     crypto.Signer
+	delName     string
+	delSPKI     []byte
 }
+
+const fakeCCKeyName = "Keppin.Test.ServingClose.0011223344556677"
 
 func (f *fakeCCKeyOps) ops(t *testing.T) ccKeyOps {
 	return ccKeyOps{
 		newName: func() (string, error) {
 			f.calls = append(f.calls, "name")
-			return "Keppin.Test.ServingClose.0011223344556677", f.nameErr
+			return fakeCCKeyName, f.nameErr
 		},
 		writeDiag: func(string) error { f.calls = append(f.calls, "diag"); return f.diagErr },
 		open: func(string) (crypto.Signer, error) {
@@ -718,9 +728,18 @@ func (f *fakeCCKeyOps) ops(t *testing.T) ccKeyOps {
 			if f.createErr != nil {
 				return nil, f.createErr
 			}
-			return newFakeCCSigner(t), nil
+			if f.unencodable {
+				f.created = unencodableSigner{}
+			} else {
+				f.created = newFakeCCSigner(t)
+			}
+			return f.created, nil
 		},
-		del: func(string) error { f.calls = append(f.calls, "delete"); return f.delErr },
+		del: func(name string, spki []byte) error {
+			f.calls = append(f.calls, "delete")
+			f.delName, f.delSPKI = name, spki
+			return f.delErr
+		},
 	}
 }
 
@@ -748,6 +767,7 @@ func TestServingCloseHarnessCleanupDecisions(t *testing.T) {
 		{"non-positive run with confirmed release: single delete, FAIL", fakeCCKeyOps{openErrs: notFound}, ccRunOutcome{Pass: false, ReleaseConfirmed: true}, "name diag open create delete", false, false},
 		{"delete fails with not found: one attempt, unconfirmed", fakeCCKeyOps{openErrs: notFound, delErr: ErrKeyNotFound}, ccRunOutcome{Pass: true, ReleaseConfirmed: true}, "name diag open create delete", false, true},
 		{"all conforming: single delete, PASS", fakeCCKeyOps{openErrs: notFound}, ccRunOutcome{Pass: true, ReleaseConfirmed: true}, "name diag open create delete", true, false},
+		{"created key public key not encodable: no delete", fakeCCKeyOps{openErrs: notFound, unencodable: true}, ccRunOutcome{Pass: true, ReleaseConfirmed: true}, "name diag open create", false, true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -761,6 +781,15 @@ func TestServingCloseHarnessCleanupDecisions(t *testing.T) {
 			}
 			if keys.preflight != nil && keys.preflight.closes.Load() != 1 {
 				t.Fatalf("preflight handle closed %d times, want 1", keys.preflight.closes.Load())
+			}
+			if strings.HasSuffix(c.calls, "delete") {
+				want, err := x509.MarshalPKIXPublicKey(keys.created.Public())
+				if err != nil {
+					t.Fatal(err)
+				}
+				if keys.delName != fakeCCKeyName || !bytes.Equal(keys.delSPKI, want) {
+					t.Fatalf("delete(%q, %x), want delete(%q, SPKI of the created key)", keys.delName, keys.delSPKI, fakeCCKeyName)
+				}
 			}
 		})
 	}
