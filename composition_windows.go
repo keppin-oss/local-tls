@@ -15,9 +15,11 @@ import (
 //
 // MUST be run elevated (Administrator). On first install (neither certificate
 // DER present) it:
-//   - creates or opens machine-scoped persisted CNG keys with per-role DACL
+//   - creates new machine-scoped persisted CNG keys with per-role DACL
 //     policies: the CA key privileged-only (SYSTEM, Administrators), the server
-//     key service-signer (SYSTEM, Administrators, LOCAL SERVICE read/execute)
+//     key service-signer (SYSTEM, Administrators, LOCAL SERVICE read/execute).
+//     It never opens or adopts an existing key: a key already persisted under a
+//     Local-TLS name fails with ErrKeyExists
 //   - generates self-signed CA and CA-signed server certificates
 //   - persists only public certificate DERs to disk (no private-key files)
 //   - installs the CA certificate in LocalMachine\Root (idempotent)
@@ -36,14 +38,11 @@ import (
 // RenewalThreshold of expiry: success means the existing state was verified,
 // not that the server certificate was renewed (renewal is StageServerRenewal
 // plus consumer confirmation). An expired leaf fails with ErrRenewalDue and
-// ErrCertificateNotValidNow. Existing-state keys are still acquired through
-// the MachineKeyStore open-or-create seam, under the same per-role policies,
-// after the open-only state check has required both keys to open; the runtime
-// and renewal paths open existing keys only. A CA key whose DACL is not
-// privileged-only (for example one provisioned by an earlier release) fails
-// closed with ErrKeyPolicyMismatch: ProvisionMachine never migrates it; run
-// MigrateMachineKeyPolicies explicitly. It does not repair trust: a missing
-// or conflicting CA trust anchor fails closed with ErrTrustNotHealthy. Partial state (exactly one
+// ErrCertificateNotValidNow. Existing-state keys are opened, never created,
+// under the same per-role policies. A key whose DACL is not exactly its role
+// policy fails closed with ErrKeyPolicyMismatch and is never rewritten. It
+// does not repair trust: a missing or conflicting CA trust anchor fails closed
+// with ErrTrustNotHealthy. Partial state (exactly one
 // certificate DER present, or a DER whose presence cannot be determined) fails
 // closed with ErrInconsistentMachineState; the CA certificate is never
 // reissued for existing state.
@@ -58,11 +57,18 @@ import (
 // Local-TLS does not implement or verify this serialization.
 //
 // First install is entered only after a conservative pre-check (see
-// provisionPreCheck). The pre-check does not prove that the CA key is absent,
-// and there is no guarantee that the CA key certified on first install was
-// created by this call: the key is opened or created after the check, so an
-// actor that violates the caller contract in that window can cause an existing
-// key to be certified. This residual risk is accepted under the contract above.
+// provisionPreCheck). The pre-check does not prove that the CA key is absent.
+// The keys are then created, never opened: a key already persisted under a
+// Local-TLS name is never adopted or certified (ErrKeyExists). A create does
+// not reserve the name, though: two overlapping creators can both succeed, the
+// later key silently replacing the earlier one. Excluding that is the caller
+// contract above.
+//
+// A first install that fails before both certificate DERs are persisted deletes
+// the keys it created, through the public key recorded right after each
+// create, and removes the DER it wrote; when that is not possible the error
+// also matches ErrRollbackIncomplete. A failure to install the trust anchor
+// after both DERs are persisted is not rolled back: run CleanupMachine.
 func ProvisionMachine() (Material, error) {
 	root, err := MachineAgentPath()
 	if err != nil {
@@ -143,9 +149,9 @@ func productionEnv() (machineEnv, error) {
 // a non-privileged caller gets ErrPrivilegeRequired when the CA key is about to
 // be opened (no key is opened before that check). It is not guaranteed to be the
 // first error: the CA certificate DER is read and parsed first, and a missing or
-// invalid DER is reported before the privilege check. A CA key still carrying
-// the legacy DACL gets ErrKeyPolicyMismatch until
-// MigrateMachineKeyPolicies is run. A non-elevated runtime (the Agent) must use
+// invalid DER is reported before the privilege check. A CA key whose DACL is
+// not exactly privileged-only gets ErrKeyPolicyMismatch. A non-elevated
+// runtime (the Agent) must use
 // LoadServingMaterial and LoadServingCandidate, which open only the server key.
 // It:
 //   - loads existing CA and server certificate DERs from disk
@@ -199,7 +205,7 @@ func ReloadMachine() (Material, error) {
 //
 // The server key is opened under the service-signer policy, which a LOCAL
 // SERVICE runtime may open; it needs no privilege and is not affected by the
-// CA key policy or its migration. A server key whose DACL is not exactly the
+// CA key policy. A server key whose DACL is not exactly the
 // service-signer form fails closed with ErrKeyPolicyMismatch. If the caller
 // cannot open the server key (e.g., running as a user without LocalService
 // rights), it fails closed.
@@ -226,8 +232,8 @@ func LoadServingMaterial() (Material, error) {
 // Stage opens the existing CA and server keys only (never creates them),
 // never installs trust and never rotates keys or the CA. Because it signs with
 // the privileged-only CA key it requires a privileged caller
-// (ErrPrivilegeRequired otherwise) and a migrated CA key (ErrKeyPolicyMismatch
-// otherwise); it is a renewal-authority operation, not an Agent one. It replaces an
+// (ErrPrivilegeRequired otherwise) and a CA key with exactly the
+// privileged-only DACL (ErrKeyPolicyMismatch otherwise); it is a renewal-authority operation, not an Agent one. It replaces an
 // invalid or stale pending candidate, so it must not run while a consumer
 // attempt for an earlier candidate is in progress (single-writer contract).
 // A staged candidate is not active and not served by LoadServingMaterial.
@@ -302,51 +308,6 @@ func AbandonServingCandidate(ref CandidateRef) error {
 		return err
 	}
 	return abandonServingCandidate(env, ref)
-}
-
-// MigrateMachineKeyPolicies is the explicit, privileged, idempotent and
-// tighten-only migration of the persisted production key DACLs to the
-// per-role policies (see keyPolicy). It exists for installations provisioned
-// before the CA key was separated from the server signer, whose CA key still
-// grants LOCAL SERVICE read/execute.
-//
-// It MUST be run by a LocalSystem or elevated Administrators caller (otherwise
-// ErrPrivilegeRequired, no key touched) and only on complete provisioned state
-// (both certificate DERs present). It:
-//   - verifies, read-only, that the server key opens under the service-signer
-//     policy and matches the persisted server certificate (the server DACL is
-//     never rewritten);
-//   - rewrites the CA key DACL in place from the exact service-signer form to
-//     privileged-only, with read-back on the open and on a fresh handle; a CA
-//     key already privileged-only is left untouched (idempotent);
-//   - verifies that the CA key opens under the privileged-only policy and
-//     matches the persisted CA certificate, and that the CA certificate DER is
-//     unchanged.
-//
-// It never creates, regenerates, rotates or deletes a key, never writes a
-// certificate and never reads or mutates LocalMachine\Root. Any other DACL, a
-// key that does not open (ErrKeyNotFound is not proof of absence), a key that
-// does not match its certificate or any ambiguous state fails closed. A failure
-// after the CA DACL write leaves the tightened DACL in place; it is never
-// rolled back, since that would widen access.
-//
-// Local-TLS never runs this migration implicitly: serving and verification
-// paths fail with ErrKeyPolicyMismatch on a legacy CA key instead. Single
-// writer: the lifecycle coordinator must not run it concurrently with
-// provisioning, renewal or cleanup.
-func MigrateMachineKeyPolicies() error {
-	tlsDir, err := MachineTLSPath()
-	if err != nil {
-		return fmt.Errorf("resolve machine agent path: %w", err)
-	}
-	return migrateKeyPolicies(keyPolicyMigration{
-		tlsDir:        tlsDir,
-		fs:            osFS,
-		isPrivileged:  callerIsPrivileged,
-		openServerKey: func() (crypto.Signer, error) { return openProductionKey(serverKeyName) },
-		tightenCAKey:  tightenCAKeyPolicy,
-		openCAKey:     func() (crypto.Signer, error) { return openProductionKey(caKeyName) },
-	})
 }
 
 // closeProductionSigner closes a CNG signer if it implements the closer

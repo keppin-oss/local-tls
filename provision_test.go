@@ -388,63 +388,132 @@ func TestTrustStoreReceivesCA(t *testing.T) {
 	}
 }
 
-// fakeMachineKeyStore returns a signer backed by an ephemeral ECDSA P-256 key.
-// Used to simulate a persisted CNG key that already exists when the cert is missing.
+// fakeMachineKeyStore is an in-memory KSP for the two Local-TLS keys. Each key
+// has a preset ephemeral ECDSA P-256 signer and an existence flag: Open*
+// returns the signer only when the key exists (ErrKeyNotFound otherwise),
+// Create* fails with ErrKeyExists when it exists and otherwise marks it
+// existing and returns the preset signer, and Delete* requires the exact SPKI
+// of the preset signer. Use a pointer so that a first install and the later
+// calls share the same state.
 type fakeMachineKeyStore struct {
 	simulateExistingCA     bool
 	simulateExistingServer bool
 	caSigner               crypto.Signer
 	serverSigner           crypto.Signer
+
+	// Injected failures, returned before any state change.
+	caCreateErr, serverCreateErr error
+	caDeleteErr, serverDeleteErr error
+
+	caCreates, serverCreates int
+	caDeletes, serverDeletes [][]byte // SPKIs passed to successful deletes
 }
 
-func newFakeMachineKeyStore(existingCA, existingServer bool) fakeMachineKeyStore {
-	ks := fakeMachineKeyStore{
+func newFakeMachineKeyStore(existingCA, existingServer bool) *fakeMachineKeyStore {
+	caKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	serverKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	return &fakeMachineKeyStore{
 		simulateExistingCA:     existingCA,
 		simulateExistingServer: existingServer,
+		caSigner:               caKey,
+		serverSigner:           serverKey,
 	}
-	if existingCA {
-		caKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-		ks.caSigner = caKey
-	}
-	if existingServer {
-		serverKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-		ks.serverSigner = serverKey
-	}
-	return ks
 }
 
-func (f fakeMachineKeyStore) LoadOrCreateCAKey() (crypto.Signer, error) {
-	if f.simulateExistingCA {
-		return f.caSigner, nil
+func fakeOpen(exists bool, signer crypto.Signer) (crypto.Signer, error) {
+	if !exists {
+		return nil, fmt.Errorf("fake key store: %w", ErrKeyNotFound)
 	}
-	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	return key, nil
+	return signer, nil
 }
 
-func (f fakeMachineKeyStore) LoadOrCreateServerKey() (crypto.Signer, error) {
-	if f.simulateExistingServer {
-		return f.serverSigner, nil
+func fakeCreate(exists *bool, signer crypto.Signer, injected error, creates *int) (crypto.Signer, error) {
+	if injected != nil {
+		return nil, injected
 	}
-	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	return key, nil
+	if *exists {
+		return nil, fmt.Errorf("fake key store: %w", ErrKeyExists)
+	}
+	*exists = true
+	*creates++
+	return signer, nil
 }
 
-// countingKeyStore records MachineKeyStore calls so tests can prove a path
-// never acquires (and therefore never creates) a key.
+func fakeDelete(exists *bool, signer crypto.Signer, spki []byte, injected error, deletes *[][]byte) error {
+	if injected != nil {
+		return injected
+	}
+	if !*exists {
+		return fmt.Errorf("fake key store: %w", ErrKeyNotFound)
+	}
+	want, err := x509.MarshalPKIXPublicKey(signer.Public())
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(spki, want) {
+		return fmt.Errorf("fake key store: %w: SPKI differs", ErrDeleteVerificationFailed)
+	}
+	*exists = false
+	*deletes = append(*deletes, bytes.Clone(spki))
+	return nil
+}
+
+func (f *fakeMachineKeyStore) OpenCAKey() (crypto.Signer, error) {
+	return fakeOpen(f.simulateExistingCA, f.caSigner)
+}
+
+func (f *fakeMachineKeyStore) OpenServerKey() (crypto.Signer, error) {
+	return fakeOpen(f.simulateExistingServer, f.serverSigner)
+}
+
+func (f *fakeMachineKeyStore) CreateCAKey() (crypto.Signer, error) {
+	return fakeCreate(&f.simulateExistingCA, f.caSigner, f.caCreateErr, &f.caCreates)
+}
+
+func (f *fakeMachineKeyStore) CreateServerKey() (crypto.Signer, error) {
+	return fakeCreate(&f.simulateExistingServer, f.serverSigner, f.serverCreateErr, &f.serverCreates)
+}
+
+func (f *fakeMachineKeyStore) DeleteCAKey(spki []byte) error {
+	return fakeDelete(&f.simulateExistingCA, f.caSigner, spki, f.caDeleteErr, &f.caDeletes)
+}
+
+func (f *fakeMachineKeyStore) DeleteServerKey(spki []byte) error {
+	return fakeDelete(&f.simulateExistingServer, f.serverSigner, spki, f.serverDeleteErr, &f.serverDeletes)
+}
+
+// countingKeyStore records MachineKeyStore acquisitions (opens and creates)
+// so tests can prove a path never acquires, and therefore never creates, a key.
 type countingKeyStore struct {
 	inner            MachineKeyStore
 	caCalls, srCalls int
+	creates          int
 }
 
-func (c *countingKeyStore) LoadOrCreateCAKey() (crypto.Signer, error) {
+func (c *countingKeyStore) OpenCAKey() (crypto.Signer, error) {
 	c.caCalls++
-	return c.inner.LoadOrCreateCAKey()
+	return c.inner.OpenCAKey()
 }
 
-func (c *countingKeyStore) LoadOrCreateServerKey() (crypto.Signer, error) {
+func (c *countingKeyStore) OpenServerKey() (crypto.Signer, error) {
 	c.srCalls++
-	return c.inner.LoadOrCreateServerKey()
+	return c.inner.OpenServerKey()
 }
+
+func (c *countingKeyStore) CreateCAKey() (crypto.Signer, error) {
+	c.caCalls++
+	c.creates++
+	return c.inner.CreateCAKey()
+}
+
+func (c *countingKeyStore) CreateServerKey() (crypto.Signer, error) {
+	c.srCalls++
+	c.creates++
+	return c.inner.CreateServerKey()
+}
+
+func (c *countingKeyStore) DeleteCAKey(spki []byte) error     { return c.inner.DeleteCAKey(spki) }
+func (c *countingKeyStore) DeleteServerKey(spki []byte) error { return c.inner.DeleteServerKey(spki) }
 
 // countingTrustStore counts InstallTrust calls on top of okTrustStore.
 func countingTrustStore(installs *int) *fakeTrustStore {
@@ -461,7 +530,7 @@ func TestProvisionPartialStateFailsClosed(t *testing.T) {
 		t.Run("missing "+missing, func(t *testing.T) {
 			dataDir := filepath.Join(t.TempDir(), "data")
 			now := time.Date(2026, 8, 8, 0, 0, 0, 0, time.UTC)
-			ks := newFakeMachineKeyStore(true, true)
+			ks := newFakeMachineKeyStore(false, false)
 			if _, err := ProvisionWithKeyStore(dataDir, ks, okTrustStore(), fixedNow(now)); err != nil {
 				t.Fatalf("first provision: %v", err)
 			}
@@ -638,7 +707,7 @@ func TestReloadRejectsCorruptCADER(t *testing.T) {
 	dataDir := filepath.Join(dir, "data")
 	now := time.Date(2026, 8, 8, 0, 0, 0, 0, time.UTC)
 
-	ks := newFakeMachineKeyStore(true, true)
+	ks := newFakeMachineKeyStore(false, false)
 	if _, err := ProvisionWithKeyStore(dataDir, ks, okTrustStore(), fixedNow(now)); err != nil {
 		t.Fatalf("first provision: %v", err)
 	}
@@ -685,7 +754,7 @@ func TestReloadWithoutRepairDoesNotInstallTrust(t *testing.T) {
 		is:      func([32]byte) (bool, error) { return false, nil },
 	}
 
-	ks1 := newFakeMachineKeyStore(true, true)
+	ks1 := newFakeMachineKeyStore(false, false)
 	if _, err := ProvisionWithKeyStore(dataDir, ks1, store, fixedNow(now)); err != nil {
 		t.Fatalf("first provision: %v", err)
 	}
@@ -712,7 +781,7 @@ func TestExistingStateProvisioningRejectsExpiredCA(t *testing.T) {
 	dataDir := filepath.Join(dir, "data")
 	now := time.Date(2026, 8, 8, 0, 0, 0, 0, time.UTC)
 
-	ks1 := newFakeMachineKeyStore(true, true)
+	ks1 := newFakeMachineKeyStore(false, false)
 	if _, err := ProvisionWithKeyStore(dataDir, ks1, okTrustStore(), fixedNow(now)); err != nil {
 		t.Fatalf("first provision: %v", err)
 	}
@@ -757,7 +826,7 @@ func TestExistingStateProvisioningRejectsNotYetValidCA(t *testing.T) {
 		t.Fatalf("write server DER: %v", err)
 	}
 
-	ks := fakeMachineKeyStore{
+	ks := &fakeMachineKeyStore{
 		simulateExistingCA:     true,
 		simulateExistingServer: true,
 		caSigner:               caSigner,

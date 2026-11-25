@@ -3,8 +3,11 @@
 package main
 
 import (
+	"bytes"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"os"
 	"testing"
 
 	"github.com/keppin-oss/local-tls"
@@ -34,6 +37,55 @@ func TestClassifyOpen(t *testing.T) {
 			got := classifyOpen(tc.err)
 			if got.label != tc.wantLabel || got.exit != tc.wantExit {
 				t.Fatalf("classifyOpen(%v) = %s/%d, want %s/%d", tc.err, got.label, got.exit, tc.wantLabel, tc.wantExit)
+			}
+		})
+	}
+}
+
+// TestParseSPKIArgs covers the -delete arguments offline: exactly one of
+// -spki and -spki-file, a non-empty base64 value, and no fallback.
+func TestParseSPKIArgs(t *testing.T) {
+	want := []byte{0x30, 0x59, 0x30, 0x13}
+	b64 := base64.StdEncoding.EncodeToString(want)
+	files := map[string][]byte{"spki.txt": []byte("  " + b64 + "\r\n"), "empty.txt": []byte("\n")}
+	readFile := func(path string) ([]byte, error) {
+		if data, ok := files[path]; ok {
+			return data, nil
+		}
+		return nil, os.ErrNotExist
+	}
+
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{"value", []string{"-spki", b64}},
+		{"file", []string{"-spki-file", "spki.txt"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseSPKIArgs(tc.args, readFile)
+			if err != nil || !bytes.Equal(got, want) {
+				t.Fatalf("parseSPKIArgs(%q) = %x, %v; want %x", tc.args, got, err, want)
+			}
+		})
+	}
+
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{"no flag", nil},
+		{"flag without value", []string{"-spki"}},
+		{"both flags", []string{"-spki", b64, "-spki-file", "spki.txt"}},
+		{"unknown flag", []string{"-key", b64}},
+		{"empty value", []string{"-spki", "  "}},
+		{"empty file", []string{"-spki-file", "empty.txt"}},
+		{"missing file", []string{"-spki-file", "missing.txt"}},
+		{"not base64", []string{"-spki", "not*base64"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got, err := parseSPKIArgs(tc.args, readFile); err == nil {
+				t.Fatalf("parseSPKIArgs(%q) = %x, want an error", tc.args, got)
 			}
 		})
 	}

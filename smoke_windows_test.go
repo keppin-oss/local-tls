@@ -131,19 +131,13 @@ func TestSmokePreflightAmbiguousAbsence(t *testing.T) {
 
 // ---- smoke cleanup ----
 
-// smokeCleanupFixture creates a smoke root holding a CA DER and returns it
-// with a trust store that records the DER passed to RemoveTrust.
+// smokeCleanupFixture creates a smoke root holding a CA and a server
+// certificate DER and returns it with a trust store that records the DER
+// passed to RemoveTrust.
 func smokeCleanupFixture(t *testing.T, removeErr error) (root string, der []byte, ts *fakeTrustStore, removed *[][]byte) {
 	t.Helper()
 	root = filepath.Join(t.TempDir(), "smoke")
-	tlsDir := filepath.Join(root, tlsSubDir)
-	if err := os.MkdirAll(tlsDir, 0700); err != nil {
-		t.Fatal(err)
-	}
-	der = []byte("smoke-ca-der")
-	if err := os.WriteFile(filepath.Join(tlsDir, caCertFile), der, 0600); err != nil {
-		t.Fatal(err)
-	}
+	der = writeCleanupStateIn(t, filepath.Join(root, tlsSubDir)).caDER
 	removed = &[][]byte{}
 	ts = &fakeTrustStore{remove: func(d []byte) error {
 		*removed = append(*removed, d)
@@ -154,8 +148,8 @@ func smokeCleanupFixture(t *testing.T, removeErr error) (root string, der []byte
 
 func countingDeleter(ca, server error, calls *int) *fakeKeyDeleter {
 	return &fakeKeyDeleter{
-		ca:     func() error { *calls++; return ca },
-		server: func() error { *calls++; return server },
+		ca:     func([]byte) error { *calls++; return ca },
+		server: func([]byte) error { *calls++; return server },
 	}
 }
 
@@ -201,8 +195,8 @@ func TestCleanupSmokeReturnsTrustFailure(t *testing.T) {
 	if calls != 2 {
 		t.Fatalf("both key deletions must still be attempted, got %d", calls)
 	}
-	if rootExists(t, root) {
-		t.Fatal("with both deletions confirmed the smoke root is removed even after a trust failure")
+	if !rootExists(t, root) {
+		t.Fatal("a failed trust removal must retain the smoke root (CA DER) for a retry")
 	}
 }
 

@@ -246,13 +246,13 @@ func newSubordinateCA(now time.Time, parent *x509.Certificate, parentKey *ecdsa.
 		return nil, nil, err
 	}
 	tmpl := &x509.Certificate{
-		SerialNumber: serial,
-		Subject:      pkix.Name{CommonName: "Keppin Test Sub CA"},
-		NotBefore:    now.Add(-5 * time.Minute),
-		NotAfter:     now.Add(24 * time.Hour),
-		IsCA:         true,
+		SerialNumber:          serial,
+		Subject:               pkix.Name{CommonName: "Keppin Test Sub CA"},
+		NotBefore:             now.Add(-5 * time.Minute),
+		NotAfter:              now.Add(24 * time.Hour),
+		IsCA:                  true,
 		BasicConstraintsValid: true,
-		KeyUsage:     x509.KeyUsageCertSign,
+		KeyUsage:              x509.KeyUsageCertSign,
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, parent, &key.PublicKey, parentKey)
 	if err != nil {

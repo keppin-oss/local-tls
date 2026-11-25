@@ -1325,7 +1325,7 @@ type ccKeyOps struct {
 	writeDiag func(name string) error
 	open      func(name string) (crypto.Signer, error)
 	create    func(name string) (crypto.Signer, error)
-	del       func(name string) error
+	del       func(name string, expectedSPKI []byte) error
 }
 
 type ccRunner func(created crypto.Signer, open func() (crypto.Signer, error)) ccRunOutcome
@@ -1376,6 +1376,10 @@ func executeServingClose(ops ccKeyOps, run ccRunner, logf func(string, ...any)) 
 		return rep
 	}
 
+	// The created key's public key is its recorded identity: the single delete
+	// is verified against it.
+	spki, spkiErr := x509.MarshalPKIXPublicKey(created.Public())
+
 	out := run(created, func() (crypto.Signer, error) { return ops.open(name) })
 	rep.Run = &out
 	if !out.ReleaseConfirmed {
@@ -1391,8 +1395,13 @@ func executeServingClose(ops ccKeyOps, run ccRunner, logf func(string, ...any)) 
 		return rep
 	}
 
+	if spkiErr != nil {
+		rep.KeyMayRemain = true
+		rep.Stage = fmt.Sprintf("the public key of %q could not be encoded, so it cannot be deleted with a verified delete; kept for an authorized recovery: %v", name, spkiErr)
+		return rep
+	}
 	rep.DeleteAttempted = true
-	if err := ops.del(name); err != nil {
+	if err := ops.del(name, spki); err != nil {
 		rep.KeyMayRemain = true
 		rep.Stage = fmt.Sprintf("delete %q not confirmed (single attempt, no retry): %v", name, err)
 		return rep

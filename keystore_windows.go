@@ -30,8 +30,8 @@ const (
 //     D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGX;;;LS), so the non-elevated Agent
 //     running as LOCAL SERVICE can open it and sign TLS handshakes.
 //
-// Any other name is rejected: Local-TLS never opens or creates a production
-// key without an explicit role policy.
+// Any other name is rejected: Local-TLS never opens, creates or deletes a
+// production key without an explicit role policy.
 func keyPolicy(name string) (windowscng.Policy, error) {
 	switch name {
 	case caKeyName:
@@ -43,19 +43,27 @@ func keyPolicy(name string) (windowscng.Policy, error) {
 	}
 }
 
-// cngPolicyAPI is the seam between Local-TLS and the policy-aware windowscng
-// functions. Production uses nativeCNGPolicyAPI; unit tests pass fakes to the
-// *With functions so no machine key is touched.
-type cngPolicyAPI struct {
-	open         func(name string, p windowscng.Policy) (windowscng.Signer, error)
-	loadOrCreate func(name string, p windowscng.Policy) (windowscng.Signer, error)
-	apply        func(name string, p windowscng.Policy) error
+// cngKeyAPI is the seam between Local-TLS and windowscng. It is typed on the
+// concrete windowscng.Policy, although windowscng accepts any KeyPolicy, so
+// Local-TLS can only pass one of its two role policies. Production uses
+// nativeCNGKeyAPI; unit tests pass fakes to the *With functions so no machine
+// key is touched.
+type cngKeyAPI struct {
+	open   func(name string, p windowscng.Policy) (windowscng.Signer, error)
+	create func(name string, p windowscng.Policy) (windowscng.Signer, error)
+	delete func(name string, p windowscng.Policy, expectedSPKI []byte) error
 }
 
-var nativeCNGPolicyAPI = cngPolicyAPI{
-	open:         windowscng.OpenWithPolicy,
-	loadOrCreate: windowscng.LoadOrCreateWithPolicy,
-	apply:        windowscng.ApplyPolicy,
+var nativeCNGKeyAPI = cngKeyAPI{
+	open: func(name string, p windowscng.Policy) (windowscng.Signer, error) {
+		return windowscng.Open(name, p)
+	},
+	create: func(name string, p windowscng.Policy) (windowscng.Signer, error) {
+		return windowscng.Create(name, p)
+	},
+	delete: func(name string, p windowscng.Policy, expectedSPKI []byte) error {
+		return windowscng.Delete(name, p, expectedSPKI)
+	},
 }
 
 // cngKeyStore implements both MachineKeyStore and MachineKeyDeleter by
@@ -65,7 +73,7 @@ var nativeCNGPolicyAPI = cngPolicyAPI{
 //
 // This package owns only the Local-TLS policy: the production key names, the
 // access policy of each key role (see keyPolicy) and the decision of which
-// semantic key (CA vs server) to create/open/delete.
+// semantic key (CA vs server) to open, create or delete.
 type cngKeyStore struct{}
 
 func platformKeyStore() (MachineKeyStore, error) {
@@ -76,51 +84,41 @@ func platformKeyDeleter() (MachineKeyDeleter, error) {
 	return &cngKeyStore{}, nil
 }
 
-// LoadOrCreateCAKey opens the CA key under PolicyPrivilegedOnly, or creates it
-// with that policy only when the native open reports it absent to a privileged
-// caller. A non-privileged caller gets ErrPrivilegeRequired; an existing key
-// with another DACL gets ErrKeyPolicyMismatch and is not modified.
-func (ks *cngKeyStore) LoadOrCreateCAKey() (crypto.Signer, error) {
-	return loadOrCreateKey(caKeyName)
+// OpenCAKey opens the existing CA key under PolicyPrivilegedOnly. It never
+// creates a key. A non-privileged caller gets ErrPrivilegeRequired; an existing
+// key with another DACL gets ErrKeyPolicyMismatch and is not modified.
+func (ks *cngKeyStore) OpenCAKey() (crypto.Signer, error) {
+	return openProductionKey(caKeyName)
 }
 
-// LoadOrCreateServerKey opens the server key under PolicyServiceSigner, or
-// creates it with that policy only when the native open reports it absent to a
-// privileged caller.
-func (ks *cngKeyStore) LoadOrCreateServerKey() (crypto.Signer, error) {
-	return loadOrCreateKey(serverKeyName)
+// OpenServerKey opens the existing server key under PolicyServiceSigner. It
+// never creates a key.
+func (ks *cngKeyStore) OpenServerKey() (crypto.Signer, error) {
+	return openProductionKey(serverKeyName)
 }
 
-// DeleteCAKey deletes exactly the persisted Local-TLS CA key.
-func (ks *cngKeyStore) DeleteCAKey() error {
-	return deleteProductionKey(caKeyName)
+// CreateCAKey creates the CA key under PolicyPrivilegedOnly. An existing key
+// returns ErrKeyExists and is not opened, adopted or modified.
+func (ks *cngKeyStore) CreateCAKey() (crypto.Signer, error) {
+	return createProductionKey(caKeyName)
 }
 
-// DeleteServerKey deletes exactly the persisted Local-TLS server key.
-func (ks *cngKeyStore) DeleteServerKey() error {
-	return deleteProductionKey(serverKeyName)
+// CreateServerKey creates the server key under PolicyServiceSigner. An
+// existing key returns ErrKeyExists and is not opened, adopted or modified.
+func (ks *cngKeyStore) CreateServerKey() (crypto.Signer, error) {
+	return createProductionKey(serverKeyName)
 }
 
-// loadOrCreateKey delegates the exact named key open-or-create to the shared
-// CNG layer under the key's role policy. Unlike the legacy
-// windowscng.LoadOrCreate, creation is attempted only when the native open
-// reports "not found" to a privileged caller; any other open failure, and an
-// existing key in another policy state, is returned without creating or
-// modifying a key.
-func loadOrCreateKey(name string) (crypto.Signer, error) {
-	return loadOrCreateKeyWith(nativeCNGPolicyAPI, name)
+// DeleteCAKey deletes exactly the persisted Local-TLS CA key whose
+// SubjectPublicKeyInfo is expectedSPKI.
+func (ks *cngKeyStore) DeleteCAKey(expectedSPKI []byte) error {
+	return deleteProductionKey(caKeyName, expectedSPKI)
 }
 
-func loadOrCreateKeyWith(api cngPolicyAPI, name string) (crypto.Signer, error) {
-	policy, err := keyPolicy(name)
-	if err != nil {
-		return nil, err
-	}
-	signer, err := api.loadOrCreate(name, policy)
-	if err != nil {
-		return nil, mapCNGError(err)
-	}
-	return signer, nil
+// DeleteServerKey deletes exactly the persisted Local-TLS server key whose
+// SubjectPublicKeyInfo is expectedSPKI.
+func (ks *cngKeyStore) DeleteServerKey(expectedSPKI []byte) error {
+	return deleteProductionKey(serverKeyName, expectedSPKI)
 }
 
 // openProductionKey opens an existing persisted CNG production key by name
@@ -129,10 +127,10 @@ func loadOrCreateKeyWith(api cngPolicyAPI, name string) (crypto.Signer, error) {
 // exactly the role policy (ErrKeyPolicyMismatch), or, for the CA key, if the
 // caller is not privileged (ErrPrivilegeRequired, before any open).
 func openProductionKey(name string) (crypto.Signer, error) {
-	return openProductionKeyWith(nativeCNGPolicyAPI, name)
+	return openProductionKeyWith(nativeCNGKeyAPI, name)
 }
 
-func openProductionKeyWith(api cngPolicyAPI, name string) (crypto.Signer, error) {
+func openProductionKeyWith(api cngKeyAPI, name string) (crypto.Signer, error) {
 	policy, err := keyPolicy(name)
 	if err != nil {
 		return nil, err
@@ -144,50 +142,71 @@ func openProductionKeyWith(api cngPolicyAPI, name string) (crypto.Signer, error)
 	return signer, nil
 }
 
-// tightenCAKeyPolicy brings the existing CA key to PolicyPrivilegedOnly in
-// place through windowscng.ApplyPolicy: idempotent when already privileged-only,
-// otherwise permitted only from the exact service-signer DACL, with read-back
-// on the open handle and on a fresh handle and no rollback. It never creates,
-// rotates or deletes the key. Used only by MigrateMachineKeyPolicies.
-func tightenCAKeyPolicy() error {
-	return tightenCAKeyPolicyWith(nativeCNGPolicyAPI)
+// createProductionKey creates a new persisted CNG production key by name under
+// its role policy. It never opens or adopts an existing key: a key already
+// persisted under the name returns ErrKeyExists. Creation requires a privileged
+// caller (ErrPrivilegeRequired). When the created key fails its post-create
+// checks, windowscng deletes it through the same handle; if that delete fails
+// too, the error also matches windowscng.ErrCleanupFailed and the key may
+// persist. The caller never owns a signer on error and must not delete again.
+func createProductionKey(name string) (crypto.Signer, error) {
+	return createProductionKeyWith(nativeCNGKeyAPI, name)
 }
 
-func tightenCAKeyPolicyWith(api cngPolicyAPI) error {
-	policy, err := keyPolicy(caKeyName)
+func createProductionKeyWith(api cngKeyAPI, name string) (crypto.Signer, error) {
+	policy, err := keyPolicy(name)
+	if err != nil {
+		return nil, err
+	}
+	signer, err := api.create(name, policy)
+	if err != nil {
+		return nil, mapCNGError(err)
+	}
+	return signer, nil
+}
+
+// deleteProductionKey deletes exactly one persisted production CNG key by name
+// after windowscng has verified, on the handle it deletes, the role policy and
+// that the public key is expectedSPKI. It never creates a key and never
+// performs wildcard/prefix deletion. An empty or malformed expectedSPKI is
+// rejected before any native call. ErrKeyNotFound means that nothing was
+// deleted, not that the key is absent.
+func deleteProductionKey(name string, expectedSPKI []byte) error {
+	return deleteProductionKeyWith(nativeCNGKeyAPI, name, expectedSPKI)
+}
+
+func deleteProductionKeyWith(api cngKeyAPI, name string, expectedSPKI []byte) error {
+	policy, err := keyPolicy(name)
 	if err != nil {
 		return err
 	}
-	return mapCNGError(api.apply(caKeyName, policy))
-}
-
-// deleteProductionKey deletes exactly one persisted production CNG key by name.
-// It never creates a key and never performs wildcard/prefix deletion. Returns
-// ErrKeyNotFound when the exact key was not found or is not accessible; that
-// means nothing was deleted, not that the key is absent. Deletion does not
-// depend on the key's DACL policy.
-func deleteProductionKey(name string) error {
-	return mapCNGError(windowscng.Delete(name))
+	return mapCNGError(api.delete(name, policy, expectedSPKI))
 }
 
 // mapCNGError translates the shared windowscng sentinels into the Local-TLS
-// contract so callers never need to know windowscng's sentinels:
+// contract, keeping the windowscng error in the chain so that its sentinels
+// and native *windowscng.NCryptError stay reachable:
 //
-//   - not found or not accessible → ErrKeyNotFound (the shared error's message,
-//     with the key name and native HRESULT, is kept; the shared sentinel is not);
+//   - verification before a delete failed → ErrDeleteVerificationFailed (it
+//     takes precedence over a policy mismatch, which it may also carry);
+//   - create found an existing key → ErrKeyExists;
+//   - not found or not accessible → ErrKeyNotFound;
 //   - DACL not in the role policy → ErrKeyPolicyMismatch;
 //   - privileged caller required → ErrPrivilegeRequired.
 //
-// For the last two the shared error stays in the chain (for example
-// windowscng.ErrCleanupFailed after a failed creation). Permission, corruption,
-// incompatible-key and other unexpected failures are passed through unchanged
-// and are never converted into not-found.
+// Invalid input, permission, corruption, incompatible-key, native delete and
+// other unexpected failures are passed through unchanged and are never
+// converted into not-found.
 func mapCNGError(err error) error {
 	switch {
 	case err == nil:
 		return nil
+	case errors.Is(err, windowscng.ErrDeleteVerificationFailed):
+		return fmt.Errorf("%w: %w", ErrDeleteVerificationFailed, err)
+	case errors.Is(err, windowscng.ErrKeyExists):
+		return fmt.Errorf("%w: %w", ErrKeyExists, err)
 	case errors.Is(err, windowscng.ErrKeyNotFound):
-		return fmt.Errorf("%w: %s", ErrKeyNotFound, err)
+		return fmt.Errorf("%w: %w", ErrKeyNotFound, err)
 	case errors.Is(err, windowscng.ErrPolicyMismatch):
 		return fmt.Errorf("%w: %w", ErrKeyPolicyMismatch, err)
 	case errors.Is(err, windowscng.ErrPrivilegeRequired):

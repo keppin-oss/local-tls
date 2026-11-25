@@ -26,10 +26,11 @@ import (
 //
 // The last case is a conservative gate, not a proof of absence: the expected
 // key DACL grants these principals full access, but ErrKeyNotFound stays
-// ambiguous for them too (for example a key with a foreign DACL). The decision
-// is also not atomic with the later open-or-create, so a key created or
-// re-permissioned by another actor in between can still be certified; callers
-// must uphold the single-writer contract documented on ProvisionMachine.
+// ambiguous for them too (for example a key with a foreign DACL). The first
+// install then creates the keys and never adopts one that already exists
+// (ErrKeyExists), but the decision is not atomic with those creates, and a
+// create does not reserve the name against a concurrent creator; callers must
+// uphold the single-writer contract documented on ProvisionMachine.
 //
 // When the CA DER exists, the check returns nil without consulting the key or
 // the caller's privilege, and provisioning continues through

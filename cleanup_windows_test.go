@@ -3,7 +3,10 @@
 package localtls
 
 import (
+	"bytes"
 	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
@@ -97,7 +100,7 @@ type smokeElevationDeps struct {
 	name   func() (string, error)
 	open   func(string) (crypto.Signer, error)
 	create func(string) (crypto.Signer, error)
-	del    func(string) error
+	del    func(name string, expectedSPKI []byte) error
 }
 
 // establishSmokeElevation verifies the elevated CNG prerequisite by creating
@@ -163,27 +166,31 @@ func establishSmokeElevationWith(deps smokeElevationDeps) (unavailable bool, err
 	}
 
 	// The probe key was created by this call. Any failure from here on is
-	// operational and must fail the test. The key is deleted only after its
-	// signer was released. When Close fails, the release of the native handle
-	// is not confirmed, so the key is not deleted: the
-	// error keeps the close cause and names the exact key for an authorized
-	// manual removal after the test process exits.
+	// operational and must fail the test. Its public key is recorded first: the
+	// delete is verified against it. The key is deleted only after its signer
+	// was released. When Close fails, the release of the native handle is not
+	// confirmed, so the key is not deleted: the error keeps the close cause and
+	// names the exact key for an authorized manual removal after the test
+	// process exits.
+	spki, spkiErr := x509.MarshalPKIXPublicKey(signer.Public())
 	if cerr := closeSigner(signer); cerr != nil {
 		return false, fmt.Errorf("close elevation probe key %q: %w: %w; the key is not deleted, remove that exact key only through an authorized manual recovery after the test process exits", probeName, errSmokeReleaseUnconfirmed, cerr)
 	}
+	if spkiErr != nil {
+		return false, fmt.Errorf("elevation probe key %q: %w: encode its public key: %w; remove that exact key only through an authorized manual recovery", probeName, ErrKeyDeletionNotCompletable, spkiErr)
+	}
 
-	if delErr := deps.del(probeName); delErr != nil {
+	if delErr := deps.del(probeName, spki); delErr != nil {
 		return false, keyCleanupError(fmt.Sprintf("delete elevation probe key %q", probeName), delErr)
 	}
 	return false, nil
 }
 
 // createCleanupFailed reports whether a create error says that the key created
-// by the failed call could not be deleted (windowscng.ErrCleanupFailed). The
-// sentinel is matched in the chain and, because mapCNGError flattens a chain
-// that also carries windowscng.ErrKeyNotFound into text, by its exact message.
+// by the failed call could not be deleted (windowscng.ErrCleanupFailed).
+// mapCNGError keeps the windowscng chain, so the sentinel is matched there.
 func createCleanupFailed(err error) bool {
-	return errors.Is(err, windowscng.ErrCleanupFailed) || strings.Contains(err.Error(), windowscng.ErrCleanupFailed.Error())
+	return errors.Is(err, windowscng.ErrCleanupFailed)
 }
 
 // isElevationUnavailable reports whether err indicates the process lacks the
@@ -263,7 +270,7 @@ type smokeLifecycleOps struct {
 	verifyTrust func(caCertDER []byte) (TrustState, error)
 	removeTrust func(caCertDER []byte) error
 	isTrusted   func(fingerprint [32]byte) (bool, error)
-	del         func(name string) error
+	del         func(name string, expectedSPKI []byte) error
 }
 
 func nativeSmokeLifecycleOps() smokeLifecycleOps {
@@ -416,8 +423,10 @@ func (r *smokeRun) keyDeletionBlocked() error {
 	return r.closeErr
 }
 
-// deleteKey deletes one smoke key by exact name, at most once per run.
-func (r *smokeRun) deleteKey(name string, a *smokeArtifact) error {
+// deleteKey deletes one smoke key by exact name, verified against its recorded
+// public key, at most once per run. Without a recorded public key the key is
+// not deleted (ErrKeyDeletionNotCompletable).
+func (r *smokeRun) deleteKey(name string, spki []byte, spkiErr error, a *smokeArtifact) error {
 	if a.outcome != smokeNotAttempted {
 		return a.err
 	}
@@ -426,7 +435,12 @@ func (r *smokeRun) deleteKey(name string, a *smokeArtifact) error {
 		a.err = fmt.Errorf("smoke key %q not deleted: %w", name, err)
 		return a.err
 	}
-	if err := r.ops.del(name); err != nil {
+	if spki == nil {
+		a.outcome = smokeFailed
+		a.err = fmt.Errorf("smoke key %q not deleted: %w: %v", name, ErrKeyDeletionNotCompletable, spkiErr)
+		return a.err
+	}
+	if err := r.ops.del(name, spki); err != nil {
 		a.outcome, a.err = smokeFailed, err
 		return err
 	}
@@ -456,12 +470,28 @@ func (r *smokeRun) removeTrustOnce(caCertDER []byte) error {
 // run, so the production cleanup is reused and its per-key outcome observed.
 type smokeRunKeyDeleter struct{ r *smokeRun }
 
-func (d smokeRunKeyDeleter) DeleteCAKey() error {
-	return d.r.deleteKey(SmokeCAKeyName, &d.r.caKey)
+func (d smokeRunKeyDeleter) DeleteCAKey(spki []byte) error {
+	return d.r.deleteKey(SmokeCAKeyName, spki, nil, &d.r.caKey)
 }
 
-func (d smokeRunKeyDeleter) DeleteServerKey() error {
-	return d.r.deleteKey(SmokeServerKeyName, &d.r.serverKey)
+func (d smokeRunKeyDeleter) DeleteServerKey(spki []byte) error {
+	return d.r.deleteKey(SmokeServerKeyName, spki, nil, &d.r.serverKey)
+}
+
+// recordedSPKI returns the recorded public key of one smoke key: from the
+// provisioned Material or, when provisioning failed part-way, from the
+// persisted certificate DER. It is never read by opening the key.
+func (r *smokeRun) recordedSPKI(certFile string, fromMaterial func(Material) *x509.Certificate) ([]byte, error) {
+	if r.material != nil {
+		if cert := fromMaterial(*r.material); cert != nil {
+			return cert.RawSubjectPublicKeyInfo, nil
+		}
+	}
+	rec := readCertRecord(filepath.Join(r.tlsDir, certFile))
+	if rec.err != nil {
+		return nil, rec.err
+	}
+	return rec.cert.RawSubjectPublicKeyInfo, nil
 }
 
 // observeDir records whether cleanupLocalTLS removed the state directory.
@@ -516,8 +546,10 @@ func (r *smokeRun) fallback() []error {
 		if der, err := r.identity(); err == nil && der != nil {
 			_ = r.removeTrustOnce(der)
 		}
-		_ = r.deleteKey(SmokeCAKeyName, &r.caKey)
-		_ = r.deleteKey(SmokeServerKeyName, &r.serverKey)
+		caSPKI, caErr := r.recordedSPKI(caCertFile, func(m Material) *x509.Certificate { return m.CACertificate })
+		_ = r.deleteKey(SmokeCAKeyName, caSPKI, caErr, &r.caKey)
+		srvSPKI, srvErr := r.recordedSPKI(serverCertFile, func(m Material) *x509.Certificate { return m.ServerCertificate })
+		_ = r.deleteKey(SmokeServerKeyName, srvSPKI, srvErr, &r.serverKey)
 	}
 	errs := r.unresolved()
 	if err := r.writeDiagnostics(); err != nil {
@@ -655,8 +687,14 @@ func runSmokeLifecycle(h smokeHarness, ops smokeLifecycleOps, diagDir string) er
 
 	// cleanupLocalTLS returns nil only when both key deletes succeeded; an
 	// ErrKeyNotFound delete is ErrKeyDeletionUnconfirmed and fails here.
-	err = cleanupLocalTLS(run.tlsDir, smokeRunKeyDeleter{run}, func() error {
-		return run.removeTrustOnce(material.CACertificate.Raw)
+	err = cleanupLocalTLS(cleanupRequest{
+		stateDir: run.tlsDir,
+		derDir:   run.tlsDir,
+		keys:     smokeRunKeyDeleter{run},
+		removeTrust: func(certRecord) error {
+			return run.removeTrustOnce(material.CACertificate.Raw)
+		},
+		namedCA: &material.CAFingerprintSHA256,
 	})
 	run.observeDir()
 	if err != nil {
@@ -845,7 +883,7 @@ func (f *fakeElevationKeys) deps() smokeElevationDeps {
 			f.created = newFakeCloseSigner()
 			return f.created, nil
 		},
-		del: func(name string) error {
+		del: func(name string, _ []byte) error {
 			f.deletes = append(f.deletes, name)
 			if i := len(f.deletes) - 1; i < len(f.delErrs) {
 				return f.delErrs[i]
@@ -941,20 +979,21 @@ func TestEstablishSmokeElevationClassification(t *testing.T) {
 // reporting a failed CNG cleanup (windowscng.ErrCleanupFailed: the key created
 // by the failed call may persist) is an operational FAIL even when
 // access-denied text appears in the original failure or only in the cleanup
-// part, including after mapCNGError has flattened the chain to text. The
-// original causes and the exact probe name are kept, and nothing is deleted.
+// part, including after mapCNGError has mapped a chain that also carries
+// ErrKeyNotFound. The original causes and the exact probe name are kept, and
+// nothing is deleted.
 // An ordinary denied create without a cleanup failure stays the SKIP
 // prerequisite.
 func TestEstablishSmokeElevationCreateCleanupFailed(t *testing.T) {
 	accessDenied := errors.New("NCryptFinalizeKey: hr=0x80090010")
 	cleanupDenied := fmt.Errorf("%w: NCryptDeleteKey: hr=0x80090010", windowscng.ErrCleanupFailed)
 	validationErr := errors.New("created key failed post-creation validation")
-	flattened := mapCNGError(errors.Join(
+	mapped := mapCNGError(errors.Join(
 		fmt.Errorf("%w: reopen created key", windowscng.ErrKeyNotFound),
 		fmt.Errorf("%w: access denied", windowscng.ErrCleanupFailed),
 	))
-	if errors.Is(flattened, windowscng.ErrCleanupFailed) {
-		t.Fatal("fixture: mapCNGError was expected to flatten this chain to text")
+	if !errors.Is(mapped, ErrKeyNotFound) || !errors.Is(mapped, windowscng.ErrCleanupFailed) {
+		t.Fatal("fixture: mapCNGError must keep both ErrKeyNotFound and windowscng.ErrCleanupFailed")
 	}
 
 	cases := []struct {
@@ -967,8 +1006,8 @@ func TestEstablishSmokeElevationCreateCleanupFailed(t *testing.T) {
 			false, []error{accessDenied, windowscng.ErrCleanupFailed}},
 		{"denial only in the cleanup part", errors.Join(validationErr, cleanupDenied),
 			false, []error{validationErr, windowscng.ErrCleanupFailed}},
-		{"failed cleanup flattened by mapCNGError", flattened,
-			false, []error{ErrKeyNotFound}},
+		{"failed cleanup mapped by mapCNGError", mapped,
+			false, []error{ErrKeyNotFound, windowscng.ErrCleanupFailed}},
 		{"ordinary denied create", accessDenied,
 			true, []error{accessDenied}},
 	}
@@ -1037,6 +1076,8 @@ type smokeFakeMachine struct {
 	provisions int
 
 	keys        map[string]bool
+	spki        map[string][]byte // recorded public key of each existing key
+	caDERs      [][]byte          // the CA DER of each provisioning
 	trusted     map[[32]byte]bool
 	preexisting map[string]*fakeCloseSigner // keys that open before the run
 	signers     []*smokeFakeSigner          // serving signers, one per Material returned
@@ -1057,6 +1098,7 @@ type smokeFakeMachine struct {
 func newSmokeFakeMachine() *smokeFakeMachine {
 	return &smokeFakeMachine{
 		keys:        map[string]bool{},
+		spki:        map[string][]byte{},
 		trusted:     map[[32]byte]bool{},
 		preexisting: map[string]*fakeCloseSigner{},
 		delErr:      map[string]error{},
@@ -1065,6 +1107,23 @@ func newSmokeFakeMachine() *smokeFakeMachine {
 }
 
 func (m *smokeFakeMachine) log(event string) { m.events = append(m.events, event) }
+
+// issue returns a CA and a server certificate for two new in-memory keys, as a
+// smoke provisioning writes them.
+func (m *smokeFakeMachine) issue() (*x509.Certificate, *x509.Certificate) {
+	now := time.Now()
+	caKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	srvKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	ca, err := generateCAWithSigner(now, caKey)
+	if err != nil {
+		panic(err)
+	}
+	srv, err := generateServerCertWithSigner(now, ca, caKey, srvKey)
+	if err != nil {
+		panic(err)
+	}
+	return ca, srv
+}
 
 // count returns how many events equal event.
 func (m *smokeFakeMachine) count(event string) int {
@@ -1127,8 +1186,11 @@ func (m *smokeFakeMachine) ops() smokeLifecycleOps {
 			if m.provisionEarlyErr != nil {
 				return Material{}, m.provisionEarlyErr
 			}
-			der := []byte(fmt.Sprintf("fake-ca-der-%d", m.provisions))
+			caCert, srvCert := m.issue()
+			der := caCert.Raw
+			m.caDERs = append(m.caDERs, der)
 			m.keys[SmokeCAKeyName], m.keys[SmokeServerKeyName] = true, true
+			m.spki[SmokeCAKeyName], m.spki[SmokeServerKeyName] = caCert.RawSubjectPublicKeyInfo, srvCert.RawSubjectPublicKeyInfo
 			tlsDir := filepath.Join(root, tlsSubDir)
 			derPath := filepath.Join(tlsDir, caCertFile)
 			if m.derAsDirectory {
@@ -1142,6 +1204,9 @@ func (m *smokeFakeMachine) ops() smokeLifecycleOps {
 				if err := os.WriteFile(derPath, der, 0o600); err != nil {
 					return Material{}, err
 				}
+			}
+			if err := os.WriteFile(filepath.Join(tlsDir, serverCertFile), srvCert.Raw, 0o600); err != nil {
+				return Material{}, err
 			}
 			if m.lockStateDir {
 				// Windows refuses to delete a file opened without
@@ -1163,7 +1228,8 @@ func (m *smokeFakeMachine) ops() smokeLifecycleOps {
 			m.signers = append(m.signers, s)
 			return Material{
 				Certificate:         tls.Certificate{PrivateKey: s},
-				CACertificate:       &x509.Certificate{Raw: der},
+				CACertificate:       caCert,
+				ServerCertificate:   srvCert,
 				CAFingerprintSHA256: sha256.Sum256(der),
 			}, nil
 		},
@@ -1187,7 +1253,7 @@ func (m *smokeFakeMachine) ops() smokeLifecycleOps {
 			m.log("trust:check")
 			return m.stillTrusted || m.trusted[fp], nil
 		},
-		del: func(name string) error {
+		del: func(name string, spki []byte) error {
 			m.log("del:" + name)
 			if n := len(m.signers); n > 0 && !m.signers[n-1].released {
 				m.violations = append(m.violations, fmt.Sprintf("key %q deleted while the serving signer was not released", name))
@@ -1198,7 +1264,12 @@ func (m *smokeFakeMachine) ops() smokeLifecycleOps {
 			if !m.keys[name] {
 				return fmt.Errorf("%w: key %q", ErrKeyNotFound, name)
 			}
+			if !bytes.Equal(spki, m.spki[name]) {
+				m.violations = append(m.violations, fmt.Sprintf("key %q deleted with an SPKI that is not its recorded one", name))
+				return fmt.Errorf("%w: key %q", ErrDeleteVerificationFailed, name)
+			}
 			delete(m.keys, name)
+			delete(m.spki, name)
 			return nil
 		},
 	}
@@ -1384,8 +1455,8 @@ func TestSmokeLifecycleCloseFailureDeletesNoKey(t *testing.T) {
 			}
 
 			reports, ders := smokeDiagFiles(t, diagDir)
-			if len(reports) != 1 || len(ders) != 1 || string(ders[0]) != "fake-ca-der-1" {
-				t.Fatalf("diagnostics: %d reports, DERs %q; want one report and the exact CA DER", len(reports), ders)
+			if len(reports) != 1 || len(ders) != 1 || !bytes.Equal(ders[0], m.caDERs[0]) {
+				t.Fatalf("diagnostics: %d reports, %d DERs; want one report and the exact CA DER", len(reports), len(ders))
 			}
 			fp := fmt.Sprintf("%x", sha256.Sum256(ders[0]))
 			for _, want := range []string{"release not confirmed", fp, SmokeCAKeyName + ": NOT ATTEMPTED by policy", SmokeServerKeyName + ": NOT ATTEMPTED by policy", tc.wantTrustNote} {
@@ -1423,7 +1494,7 @@ func TestSmokeLifecycleFallbackAfterPartialProvisioning(t *testing.T) {
 		if len(h.errors) != 0 {
 			t.Fatalf("fallback reported %v", h.errors)
 		}
-		if _, ders := smokeDiagFiles(t, diagDir); len(ders) != 1 || string(ders[0]) != "fake-ca-der-1" {
+		if _, ders := smokeDiagFiles(t, diagDir); len(ders) != 1 || !bytes.Equal(ders[0], m.caDERs[0]) {
 			t.Fatalf("diagnostic DERs %q, want the persisted CA DER", ders)
 		}
 	})
@@ -1435,8 +1506,8 @@ func TestSmokeLifecycleFallbackAfterPartialProvisioning(t *testing.T) {
 		if n := m.count("trust:remove"); n != 0 {
 			t.Fatalf("trust removal attempted without a CA DER")
 		}
-		if m.countPrefix("del:") != 2 || !errors.Is(joinedErrors(h.errors), ErrKeyDeletionUnconfirmed) {
-			t.Fatalf("events %v, errors %v: want both deletes attempted and reported unconfirmed", m.events, h.errors)
+		if m.countPrefix("del:") != 0 || !errors.Is(joinedErrors(h.errors), ErrKeyDeletionNotCompletable) {
+			t.Fatalf("events %v, errors %v: want no delete without a recorded key identity, reported not completable", m.events, h.errors)
 		}
 		if reports, _ := smokeDiagFiles(t, diagDir); len(reports) != 1 || !strings.Contains(reports[0], "no CA DER was written") {
 			t.Fatalf("diagnostics %v", reports)
@@ -1518,7 +1589,7 @@ func TestSmokeLifecyclePartialCleanup(t *testing.T) {
 		wantDiag   string // extra text the diagnostics must contain
 	}{
 		{"server delete fails", func(m *smokeFakeMachine) { m.delErr[SmokeServerKeyName] = inUse }, []error{inUse}, SmokeCAKeyName, true, "key in use"},
-		{"trust removal fails", func(m *smokeFakeMachine) { m.trustErr = trustFailure }, []error{trustFailure}, SmokeCAKeyName, false, "remove anchor failed"},
+		{"trust removal fails", func(m *smokeFakeMachine) { m.trustErr = trustFailure }, []error{trustFailure}, SmokeCAKeyName, true, "remove anchor failed"},
 		{"CA delete not found", func(m *smokeFakeMachine) { m.delErr[SmokeCAKeyName] = ErrKeyNotFound }, []error{ErrKeyDeletionUnconfirmed}, SmokeServerKeyName, true, "key deletion unconfirmed"},
 		{"state directory removal fails", func(m *smokeFakeMachine) { m.lockStateDir = true }, nil, SmokeCAKeyName, true, "main cleanup error: remove TLS state directory"},
 	}
@@ -1602,7 +1673,7 @@ func TestSmokeLifecycleSecondCycleFailure(t *testing.T) {
 		t.Fatalf("fallback reported %v, want the close cause", h.errors)
 	}
 	reports, ders := smokeDiagFiles(t, diagDir)
-	if len(reports) != 1 || len(ders) != 1 || string(ders[0]) != "fake-ca-der-2" {
+	if len(reports) != 1 || len(ders) != 1 || !bytes.Equal(ders[0], m.caDERs[1]) {
 		t.Fatalf("diagnostics: %d reports, DERs %q; want one report for the second cycle", len(reports), ders)
 	}
 }

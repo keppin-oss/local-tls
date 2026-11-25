@@ -5,6 +5,10 @@ package localtls
 import (
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -96,52 +100,124 @@ func TestUsesSharedWindowscngPackage(t *testing.T) {
 	}
 }
 
+// implSelectors returns, for one implementation file, every selector used on
+// the windowscng package (windowscng.Open → "Open") and every identifier
+// declared or referenced in it. It parses the code, so comments and the tests
+// that list forbidden names do not count.
+func implSelectors(t *testing.T, file, src string) (cng map[string]bool, idents map[string]bool, literals []string) {
+	t.Helper()
+	f, err := parser.ParseFile(token.NewFileSet(), file, src, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parse %s: %v", file, err)
+	}
+	cng, idents = map[string]bool{}, map[string]bool{}
+	ast.Inspect(f, func(n ast.Node) bool {
+		switch x := n.(type) {
+		case *ast.SelectorExpr:
+			if pkg, ok := x.X.(*ast.Ident); ok && pkg.Name == "windowscng" {
+				cng[x.Sel.Name] = true
+			}
+		case *ast.Ident:
+			idents[x.Name] = true
+		case *ast.BasicLit:
+			if x.Kind == token.STRING {
+				literals = append(literals, x.Value)
+			}
+		}
+		return true
+	})
+	return cng, idents, literals
+}
+
 // TestKeyRolesDelegateCustodyToWindowscng proves both the CA and server key
-// roles delegate open/create/delete custody to the shared windowscng package
-// through the policy-aware API, rather than retaining a second native
-// implementation.
+// roles delegate open, create and delete custody to the cng v0.5 primitives,
+// rather than retaining a second native implementation.
 func TestKeyRolesDelegateCustodyToWindowscng(t *testing.T) {
 	src, ok := localTLSImplFiles(t)["keystore_windows.go"]
 	if !ok {
 		t.Fatal("keystore_windows.go not found")
 	}
-	for _, call := range []string{
-		"windowscng.LoadOrCreateWithPolicy",
-		"windowscng.OpenWithPolicy",
-		"windowscng.ApplyPolicy",
-		"windowscng.Delete",
-	} {
-		if !strings.Contains(src, call) {
-			t.Errorf("keystore_windows.go does not delegate to %s", call)
+	cng, _, _ := implSelectors(t, "keystore_windows.go", src)
+	for _, fn := range []string{"Open", "Create", "Delete"} {
+		if !cng[fn] {
+			t.Errorf("keystore_windows.go does not delegate to windowscng.%s", fn)
 		}
 	}
 }
 
-// legacyPolicyFreeCalls are the windowscng v0.1 functions that open or create
-// a key with the single shared service-signer DACL and validate it without a
-// per-key policy. Production key custody must not use them.
-var legacyPolicyFreeCalls = []string{"windowscng.Open(", "windowscng.LoadOrCreate("}
-
-// TestProductionCodeAvoidsLegacyPolicyFreeCNG proves that no production
-// implementation file opens or creates a key through the legacy, policy-free
-// windowscng functions. verify_windows.go is the only exception: its exported
-// Test* helpers are restricted to the Keppin.Test.* namespace and never touch
-// a production key name.
-func TestProductionCodeAvoidsLegacyPolicyFreeCNG(t *testing.T) {
-	for file, src := range localTLSImplFiles(t) {
-		if file == "verify_windows.go" {
-			continue
+// moduleImplFiles returns every non-test .go file of the module, keyed by its
+// slash-separated path from the module root, whatever its build tags: the
+// package root, cmd/, internal/ and examples/. Hidden directories, testdata,
+// vendor and the generated graphify-out are skipped.
+func moduleImplFiles(t *testing.T) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	err := filepath.WalkDir(".", func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
 		}
-		for _, call := range legacyPolicyFreeCalls {
-			if strings.Contains(src, call) {
-				t.Errorf("%s calls legacy policy-free %s; use the per-role policy API", file, call)
+		if d.IsDir() {
+			name := d.Name()
+			if path != "." && (strings.HasPrefix(name, ".") || name == "testdata" || name == "vendor" || name == "graphify-out") {
+				return filepath.SkipDir
 			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		out[filepath.ToSlash(path)] = string(data)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"keystore_windows.go", "cmd/verify/main.go", "internal/identity/identity.go"} {
+		if _, ok := out[want]; !ok {
+			t.Fatalf("module scan missed %s", want)
 		}
 	}
-	src := localTLSImplFiles(t)["verify_windows.go"]
-	for _, name := range []string{"caKeyName", "serverKeyName", "ProdCAKeyName", "ProdServerKeyName"} {
-		if strings.Contains(src, name) {
-			t.Errorf("verify_windows.go (legacy test-namespace helpers) must not reference production key %s", name)
+	return out
+}
+
+// removedCNGFunctions are the windowscng functions removed in cng v0.5.0,
+// together with Apply, which Local-TLS no longer uses: no key DACL is ever
+// rewritten.
+var removedCNGFunctions = []string{
+	"LoadOrCreate", "LoadOrCreateWithPolicy", "OpenWithPolicy", "ApplyPolicy",
+	"OpenForService", "LoadOrCreateForService", "CreateForService",
+	"DeleteForService", "ApplyServicePolicy", "Apply",
+}
+
+// TestNoRemovedKeyLifecycleInCode proves, on the parsed implementation code of
+// every package of the module, that no file calls a removed or unused
+// windowscng function, that no open-or-create helper survives under any name,
+// and that no certreq path exists. The check reads code, not text, so this
+// test may name them.
+func TestNoRemovedKeyLifecycleInCode(t *testing.T) {
+	for file, src := range moduleImplFiles(t) {
+		cng, idents, literals := implSelectors(t, file, src)
+		for _, fn := range removedCNGFunctions {
+			if cng[fn] {
+				t.Errorf("%s calls windowscng.%s", file, fn)
+			}
+		}
+		for id := range idents {
+			if strings.Contains(strings.ToLower(id), "loadorcreate") {
+				t.Errorf("%s declares or references %s: opening and creating a key are separate operations", file, id)
+			}
+			if strings.Contains(strings.ToLower(id), "certreq") {
+				t.Errorf("%s declares or references %s: Local-TLS has no certreq path", file, id)
+			}
+		}
+		for _, lit := range literals {
+			if strings.Contains(strings.ToLower(lit), "certreq") {
+				t.Errorf("%s contains the string %s: Local-TLS runs no certreq", file, lit)
+			}
 		}
 	}
 }
@@ -168,14 +244,14 @@ func TestKeyPolicyPerRole(t *testing.T) {
 	}
 }
 
-// recordingPolicyAPI is a cngPolicyAPI fake that records every call and never
+// recordingKeyAPI is a cngKeyAPI fake that records every call and never
 // touches a machine key.
-type recordingPolicyAPI struct {
+type recordingKeyAPI struct {
 	calls []string
 	err   error
 }
 
-func (r *recordingPolicyAPI) api() cngPolicyAPI {
+func (r *recordingKeyAPI) api() cngKeyAPI {
 	signer := func(op, name string, p windowscng.Policy) (windowscng.Signer, error) {
 		r.calls = append(r.calls, op+" "+name+" "+p.String())
 		if r.err != nil {
@@ -183,42 +259,44 @@ func (r *recordingPolicyAPI) api() cngPolicyAPI {
 		}
 		return newFakeCloseSigner(), nil
 	}
-	return cngPolicyAPI{
+	return cngKeyAPI{
 		open: func(name string, p windowscng.Policy) (windowscng.Signer, error) {
 			return signer("open", name, p)
 		},
-		loadOrCreate: func(name string, p windowscng.Policy) (windowscng.Signer, error) {
-			return signer("loadOrCreate", name, p)
+		create: func(name string, p windowscng.Policy) (windowscng.Signer, error) {
+			return signer("create", name, p)
 		},
-		apply: func(name string, p windowscng.Policy) error {
-			r.calls = append(r.calls, "apply "+name+" "+p.String())
+		delete: func(name string, p windowscng.Policy, spki []byte) error {
+			r.calls = append(r.calls, "delete "+name+" "+p.String()+" "+string(spki))
 			return r.err
 		},
 	}
 }
 
-// TestProductionKeyOperationsUseRolePolicy proves that open, open-or-create and
-// tighten pass exactly the role policy of each key to windowscng.
+// TestProductionKeyOperationsUseRolePolicy proves that open, create and delete
+// pass exactly the role policy of each key to windowscng, and the expected
+// SPKI unchanged to delete.
 func TestProductionKeyOperationsUseRolePolicy(t *testing.T) {
-	rec := &recordingPolicyAPI{}
+	rec := &recordingKeyAPI{}
 	api := rec.api()
 	for _, name := range []string{caKeyName, serverKeyName} {
 		if _, err := openProductionKeyWith(api, name); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := loadOrCreateKeyWith(api, name); err != nil {
+		if _, err := createProductionKeyWith(api, name); err != nil {
+			t.Fatal(err)
+		}
+		if err := deleteProductionKeyWith(api, name, []byte("spki-"+name)); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := tightenCAKeyPolicyWith(api); err != nil {
-		t.Fatal(err)
-	}
 	want := []string{
 		"open " + caKeyName + " privileged-only",
-		"loadOrCreate " + caKeyName + " privileged-only",
+		"create " + caKeyName + " privileged-only",
+		"delete " + caKeyName + " privileged-only spki-" + caKeyName,
 		"open " + serverKeyName + " service-signer",
-		"loadOrCreate " + serverKeyName + " service-signer",
-		"apply " + caKeyName + " privileged-only",
+		"create " + serverKeyName + " service-signer",
+		"delete " + serverKeyName + " service-signer spki-" + serverKeyName,
 	}
 	if strings.Join(rec.calls, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("calls:\n%s\nwant:\n%s", strings.Join(rec.calls, "\n"), strings.Join(want, "\n"))
@@ -228,22 +306,26 @@ func TestProductionKeyOperationsUseRolePolicy(t *testing.T) {
 // TestProductionKeyOperationsRejectUnknownName proves no windowscng call is
 // made for a name without a role policy.
 func TestProductionKeyOperationsRejectUnknownName(t *testing.T) {
-	rec := &recordingPolicyAPI{}
+	rec := &recordingKeyAPI{}
 	api := rec.api()
 	name := identity.TestKeyNamespace + "Unknown"
 	if _, err := openProductionKeyWith(api, name); err == nil {
 		t.Error("open of an unknown name succeeded")
 	}
-	if _, err := loadOrCreateKeyWith(api, name); err == nil {
-		t.Error("open-or-create of an unknown name succeeded")
+	if _, err := createProductionKeyWith(api, name); err == nil {
+		t.Error("create of an unknown name succeeded")
+	}
+	if err := deleteProductionKeyWith(api, name, []byte("spki")); err == nil {
+		t.Error("delete of an unknown name succeeded")
 	}
 	if len(rec.calls) != 0 {
 		t.Fatalf("windowscng called for an unknown name: %v", rec.calls)
 	}
 }
 
-// TestProductionKeyOperationsMapPolicyErrors proves that the policy-aware
-// windowscng failures reach callers as Local-TLS sentinels.
+// TestProductionKeyOperationsMapPolicyErrors proves that the windowscng
+// failures of every operation reach callers as Local-TLS sentinels, with the
+// windowscng sentinel still in the chain.
 func TestProductionKeyOperationsMapPolicyErrors(t *testing.T) {
 	for _, tc := range []struct {
 		cngErr error
@@ -253,17 +335,62 @@ func TestProductionKeyOperationsMapPolicyErrors(t *testing.T) {
 		{fmt.Errorf("key %q (privileged-only): %w: persisted DACL is service-signer", caKeyName, windowscng.ErrPolicyMismatch), ErrKeyPolicyMismatch},
 		{windowscng.ErrPrivilegeRequired, ErrPrivilegeRequired},
 	} {
-		rec := &recordingPolicyAPI{err: tc.cngErr}
+		rec := &recordingKeyAPI{err: tc.cngErr}
 		api := rec.api()
-		if _, err := openProductionKeyWith(api, caKeyName); !errors.Is(err, tc.want) {
-			t.Errorf("open: %v, want %v", err, tc.want)
+		if _, err := openProductionKeyWith(api, caKeyName); !errors.Is(err, tc.want) || !errors.Is(err, tc.cngErr) {
+			t.Errorf("open: %v, want %v and the cng error", err, tc.want)
 		}
-		if _, err := loadOrCreateKeyWith(api, caKeyName); !errors.Is(err, tc.want) {
-			t.Errorf("loadOrCreate: %v, want %v", err, tc.want)
+		if _, err := createProductionKeyWith(api, caKeyName); !errors.Is(err, tc.want) || !errors.Is(err, tc.cngErr) {
+			t.Errorf("create: %v, want %v and the cng error", err, tc.want)
 		}
-		if err := tightenCAKeyPolicyWith(api); !errors.Is(err, tc.want) {
-			t.Errorf("apply: %v, want %v", err, tc.want)
+		if err := deleteProductionKeyWith(api, caKeyName, []byte("spki")); !errors.Is(err, tc.want) || !errors.Is(err, tc.cngErr) {
+			t.Errorf("delete: %v, want %v and the cng error", err, tc.want)
 		}
+	}
+}
+
+// TestMapCNGErrorKeyExists proves that a create collision maps to ErrKeyExists
+// with the native NTE_EXISTS status still reachable.
+func TestMapCNGErrorKeyExists(t *testing.T) {
+	native := &windowscng.NCryptError{Op: "NCryptCreatePersistedKey", Code: windowscng.NTEExists}
+	err := mapCNGError(fmt.Errorf("key %q: %w", caKeyName, errors.Join(windowscng.ErrKeyExists, native)))
+	if !errors.Is(err, ErrKeyExists) || !errors.Is(err, windowscng.ErrKeyExists) {
+		t.Fatalf("mapped %v, want ErrKeyExists at both levels", err)
+	}
+	var got *windowscng.NCryptError
+	if !errors.As(err, &got) || got.Code != windowscng.NTEExists {
+		t.Fatalf("mapped %v lost the native NTE_EXISTS", err)
+	}
+	for _, s := range []error{ErrKeyNotFound, ErrKeyPolicyMismatch, ErrPrivilegeRequired, ErrDeleteVerificationFailed} {
+		if errors.Is(err, s) {
+			t.Fatalf("a create collision mapped to %v", s)
+		}
+	}
+}
+
+// TestMapCNGErrorDeleteVerification proves that a failed pre-delete
+// verification maps to ErrDeleteVerificationFailed, which takes precedence over
+// the policy mismatch it may carry, and is never ErrKeyNotFound.
+func TestMapCNGErrorDeleteVerification(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		cause error
+	}{
+		{"SPKI mismatch", fmt.Errorf("%w: public key differs from the expected SPKI", windowscng.ErrDeleteVerificationFailed)},
+		{"policy mismatch", fmt.Errorf("%w: %w", windowscng.ErrDeleteVerificationFailed, windowscng.ErrPolicyMismatch)},
+		{"check not completed", errors.Join(windowscng.ErrDeleteVerificationFailed, &windowscng.NCryptError{Op: "NCryptGetProperty(Export Policy)", Code: windowscng.NTEPerm})},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := mapCNGError(tc.cause)
+			if !errors.Is(err, ErrDeleteVerificationFailed) || !errors.Is(err, windowscng.ErrDeleteVerificationFailed) {
+				t.Fatalf("mapped %v, want ErrDeleteVerificationFailed at both levels", err)
+			}
+			for _, s := range []error{ErrKeyNotFound, ErrKeyPolicyMismatch, ErrKeyExists} {
+				if errors.Is(err, s) {
+					t.Fatalf("a failed delete verification mapped to %v", s)
+				}
+			}
+		})
 	}
 }
 
@@ -384,15 +511,11 @@ func TestNoMachineIdentityOrEnterpriseTLSIdentity(t *testing.T) {
 }
 
 // TestMapCNGErrorNotFound verifies the shared missing-key sentinel is mapped to
-// the Local-TLS ErrKeyNotFound contract so callers never need to know
-// windowscng's sentinel.
+// the Local-TLS ErrKeyNotFound contract and stays reachable in the chain.
 func TestMapCNGErrorNotFound(t *testing.T) {
 	err := mapCNGError(windowscng.ErrKeyNotFound)
-	if !errors.Is(err, ErrKeyNotFound) {
-		t.Fatalf("mapCNGError(windowscng.ErrKeyNotFound) = %v, want ErrKeyNotFound", err)
-	}
-	if errors.Is(err, windowscng.ErrKeyNotFound) {
-		t.Fatal("mapped error must not leak the windowscng sentinel")
+	if !errors.Is(err, ErrKeyNotFound) || !errors.Is(err, windowscng.ErrKeyNotFound) {
+		t.Fatalf("mapCNGError(windowscng.ErrKeyNotFound) = %v, want ErrKeyNotFound at both levels", err)
 	}
 }
 
@@ -409,21 +532,21 @@ func TestMapCNGErrorNotFoundWrapped(t *testing.T) {
 }
 
 // TestMapCNGErrorKeepsNativeHRESULT verifies the mapped error keeps the key
-// name and native HRESULT that windowscng v0.2.0 puts in its wrapping error,
-// while remaining matchable as ErrKeyNotFound and not leaking the sentinel.
+// name and native HRESULT of the windowscng error, and its native
+// *NCryptError, while matching ErrKeyNotFound.
 func TestMapCNGErrorKeepsNativeHRESULT(t *testing.T) {
-	underlying := fmt.Errorf("key %q: NCryptOpenKey hr=0x%x: %w", serverKeyName, uint32(0x80090016), windowscng.ErrKeyNotFound)
+	native := &windowscng.NCryptError{Op: "NCryptOpenKey", Code: windowscng.NTEBadKeyset}
+	underlying := fmt.Errorf("key %q: %w", serverKeyName, errors.Join(windowscng.ErrKeyNotFound, native))
 	err := mapCNGError(underlying)
 	if !errors.Is(err, ErrKeyNotFound) {
 		t.Fatalf("mapped error must match ErrKeyNotFound: %v", err)
 	}
-	if errors.Is(err, windowscng.ErrKeyNotFound) {
-		t.Fatal("mapped error must not leak the windowscng sentinel")
+	var got *windowscng.NCryptError
+	if !errors.As(err, &got) || got.Code != windowscng.NTEBadKeyset {
+		t.Fatalf("mapped error %v lost the native cause", err)
 	}
-	for _, want := range []string{"hr=0x80090016", serverKeyName} {
-		if !strings.Contains(err.Error(), want) {
-			t.Fatalf("mapped error %q lost %q", err, want)
-		}
+	if !strings.Contains(err.Error(), serverKeyName) {
+		t.Fatalf("mapped error %q lost the key name", err)
 	}
 }
 

@@ -9,14 +9,15 @@ Every claim in this document is traceable to the source, the tests, the build
 tags, or `go.mod`. Where a behavior is not demonstrable from this repository, it
 is labeled explicitly.
 
-This document describes **v0.4.0**. Upgrading from v0.3.x? See
-[Upgrading from v0.3.x to v0.4.0](#upgrading-from-v03x-to-v040): one new
-exported error, and existing CAs must be replaced. Upgrading from v0.2.x? Read
-[Upgrading from v0.2.x to v0.3.0](#upgrading-from-v02x-to-v030) first: v0.3.0
-changes who may call several entry points and requires an explicit, privileged
-key-ACL migration on existing installations. Upgrading from v0.1.x? Also read
-[Upgrading from v0.1.x](#upgrading-from-v01x): v0.2.0 contains intentional
-breaking behavior changes.
+This document describes **v0.5.0**. Upgrading from v0.4.x? Read
+[Upgrading from v0.4.x to v0.5.0](#upgrading-from-v04x-to-v050) first: the
+module requires `github.com/keppin-oss/cng` v0.5.1, the key store separates
+open and create, key deletes are verified against the recorded public key, and
+the in-place key-ACL migration is removed. The earlier upgrade sections, from
+[Upgrading from v0.3.x to v0.4.0](#upgrading-from-v03x-to-v040) down to
+[Upgrading from v0.1.x](#upgrading-from-v01x), are kept as the historical
+record of those releases; the v0.3.0 key-ACL migration they describe no longer
+exists.
 
 ---
 
@@ -93,12 +94,12 @@ trust-store framework.
   explicit unsupported-platform errors (see
   [Windows / platform behavior](#windows--platform-behavior)).
 - **Administrative operations** — `ProvisionMachine`, `ReloadMachine`,
-  `StageServerRenewal`, `MigrateMachineKeyPolicies`, `CleanupMachine` and
-  `CleanupMachineBySHA256` must be called by LocalSystem or an elevated
-  Administrators member (caller responsibility). The first four open the
-  privileged-only CA key and fail closed otherwise (policy; see
-  [Key access policies](#key-access-policies)); cleanup needs the same
-  authority to delete the keys and the trust anchor.
+  `StageServerRenewal`, `CleanupMachine` and `CleanupMachineBySHA256` must be
+  called by LocalSystem or an elevated Administrators member (caller
+  responsibility). The first three open the privileged-only CA key and fail
+  closed otherwise (policy; see [Key access policies](#key-access-policies));
+  creating and deleting a key always need that authority, so first install and
+  cleanup need it too.
 - **Serving operations** — `LoadServingMaterial` and `LoadServingCandidate`
   need a principal that the server key DACL actually authorizes (in practice
   LOCAL SERVICE, LocalSystem or an elevated Administrator) plus read access to
@@ -118,9 +119,9 @@ trust-store framework.
   `StageServerRenewal` → `LoadServingCandidate` → consumer activation and
   attestation → `ConfirmServingCandidate` or `AbandonServingCandidate`) never
   overlap, and that no other actor creates, deletes or re-permissions the
-  Local TLS key names or state directory while they run. The key-ACL migration
-  (`MigrateMachineKeyPolicies`) is part of the same serialization. Local TLS
-  does **not** implement or verify this serialization. The digest checks of the
+  Local TLS key names or state directory while they run. Local TLS does **not**
+  implement or verify this serialization: a key create does not reserve the
+  name, so two overlapping creators can both succeed. The digest checks of the
   renewal API detect some violations, not all; they are not a lock.
 - **Microsoft Software Key Storage Provider** is the only supported key store.
 - **Go** — the module declares `go 1.26.8`.
@@ -128,7 +129,7 @@ trust-store framework.
 ### Dependencies
 
 ```
-github.com/keppin-oss/cng v0.3.1      // windowscng — CNG/KSP key custody
+github.com/keppin-oss/cng v0.5.1      // windowscng — CNG/KSP key custody
 golang.org/x/sys        v0.47.0       // Windows syscall bindings
 ```
 
@@ -177,10 +178,6 @@ func ReloadMachine() (Material, error)
 func LoadServingMaterial() (Material, error)
 func CleanupMachine() error
 func CleanupMachineBySHA256(fp [32]byte) error
-
-// Explicit, privileged key-ACL migration for installations provisioned before
-// the CA key was separated from the server signer
-func MigrateMachineKeyPolicies() error
 
 // Staged server-certificate renewal
 func StageServerRenewal() (CandidateRef, error)
@@ -253,11 +250,16 @@ var (
 	ErrCandidatePromoted    error
 	ErrPromotionUnconfirmed error
 
-	ErrKeyNotFound            error // CNG key not found OR not accessible
-	ErrKeyPolicyMismatch      error // key DACL is not its role policy; key unchanged
-	ErrPrivilegeRequired      error // CA key or migration needs SYSTEM/elevated Administrators
-	ErrKeyDeletionUnconfirmed error // cleanup could not confirm a key deletion
-	ErrTrustAnchorNotFound    error // exact trust anchor already absent
+	ErrKeyNotFound               error // CNG key not found OR not accessible
+	ErrKeyPolicyMismatch         error // key DACL is not its role policy; key unchanged
+	ErrPrivilegeRequired         error // needs SYSTEM/elevated Administrators
+	ErrKeyExists                 error // a create found a key under the name; key unchanged
+	ErrDeleteVerificationFailed  error // pre-delete check did not pass; nothing deleted
+	ErrKeyDeletionNotCompletable error // no recorded key identity; key not deleted
+	ErrKeyDeletionUnconfirmed    error // cleanup could not confirm a key deletion
+	ErrRollbackIncomplete        error // a failed first install left an artifact behind
+	ErrKeyReleaseUnconfirmed     error // a first-install key handle release failed
+	ErrTrustAnchorNotFound       error // exact trust anchor already absent
 )
 ```
 
@@ -265,12 +267,15 @@ var (
 
 ```go
 type MachineKeyStore interface {
-	LoadOrCreateCAKey() (crypto.Signer, error)
-	LoadOrCreateServerKey() (crypto.Signer, error)
+	OpenCAKey() (crypto.Signer, error)
+	OpenServerKey() (crypto.Signer, error)
+	CreateCAKey() (crypto.Signer, error)
+	CreateServerKey() (crypto.Signer, error)
+	MachineKeyDeleter
 }
 type MachineKeyDeleter interface {
-	DeleteCAKey() error
-	DeleteServerKey() error
+	DeleteCAKey(expectedSPKI []byte) error
+	DeleteServerKey(expectedSPKI []byte) error
 }
 func PlatformKeyStore() (MachineKeyStore, error)
 func PlatformKeyDeleter() (MachineKeyDeleter, error)
@@ -278,17 +283,33 @@ func PlatformKeyDeleter() (MachineKeyDeleter, error)
 
 `PlatformKeyStore` / `PlatformKeyDeleter` are the production platform seams the
 entry points compose through. They are not intended for consumers to swap out the
-production CNG path. `ErrKeyNotFound` means the native open of the exact
-persisted key reported it as **not found or not accessible**: it does **not**
-prove that the key is absent, and it must never by itself trigger a reset,
-regeneration or overwrite of a key (policy). Its message keeps the native
-HRESULT.
+production CNG path.
+
+- **Open and create are separate operations.** `Open*` never creates a key.
+  `Create*` never opens, adopts or modifies an existing key: a key already
+  persisted under the name returns `ErrKeyExists`. Only the first install
+  creates keys. The returned signer carries the new key's identity: its DER
+  SubjectPublicKeyInfo is `x509.MarshalPKIXPublicKey(signer.Public())`, which a
+  direct caller records before using the key; Local TLS keeps it in memory
+  right after the create and durably in the certificate DER.
+- **Deletes are verified.** `Delete*` requires the DER SubjectPublicKeyInfo of
+  the key to delete, taken from a record: the persisted certificate, or the key
+  just created by a failed first install. It is never derived by opening the
+  key name. The CNG layer verifies the role policy and that public key on the
+  handle it deletes; a check that does not pass, or cannot be completed, returns
+  `ErrDeleteVerificationFailed` and deletes nothing.
+- `ErrKeyNotFound` means the native open of the exact persisted key reported it
+  as **not found or not accessible**: it does **not** prove that the key is
+  absent, and it must never by itself trigger a reset, regeneration, create or
+  overwrite of a key (policy).
+- Every CNG error keeps its chain: the `windowscng` sentinel and the native
+  `*windowscng.NCryptError` (with the HRESULT) stay reachable with `errors.Is`
+  and `errors.As` below the Local TLS sentinel.
 
 ### Key access policies
 
-Each production key has its own DACL policy, applied through the policy-aware
-API of `github.com/keppin-oss/cng/windowscng` (`OpenWithPolicy`,
-`LoadOrCreateWithPolicy`, `ApplyPolicy`):
+Each production key has its own DACL policy, passed explicitly to every
+`github.com/keppin-oss/cng/windowscng` call (`Open`, `Create`, `Delete`):
 
 | Key | Policy | DACL | Who can open it |
 | --- | --- | --- | --- |
@@ -302,23 +323,25 @@ policy. This was observed on a real Windows 11 KSP (see
 [Windows validation of the key policies](#windows-validation-of-the-key-policies)).
 
 - Every open verifies that the persisted DACL is **exactly** the role policy;
-  anything else fails closed with `ErrKeyPolicyMismatch` and the key is not
-  modified.
-- Creation happens only on first install, only for a privileged caller, and only
-  when the native open reports the key as not found; any other open failure is
-  returned without creating a key.
-- `CleanupMachine` deletes by exact name and does not depend on the policy.
-- Installations provisioned before v0.3.0 have a CA key with the server signer
-  DACL. Serving keeps working on them, but `ProvisionMachine`, `ReloadMachine`
-  and `StageServerRenewal` fail with `ErrKeyPolicyMismatch` until an elevated
-  caller runs `MigrateMachineKeyPolicies` once. Local-TLS never migrates
-  implicitly. See [Upgrading from v0.2.x to v0.3.0](#upgrading-from-v02x-to-v030).
+  anything else, including extra entries, an unprotected DACL or access masks
+  outside the policy, fails closed with `ErrKeyPolicyMismatch` and the key is
+  not modified.
+- Creation happens only on first install, only for a privileged caller, and
+  never over an existing key (`ErrKeyExists`).
+- Cleanup deletes each key only if its DACL is exactly its role policy and its
+  public key is the one of its certificate.
+- Local TLS never rewrites a key DACL. A CA key that still carries the
+  service-signer DACL of a release before v0.3.0 fails with
+  `ErrKeyPolicyMismatch` on every path that needs it, and also fails the
+  verified delete; such an installation needs an authorized administrative
+  recovery (see
+  [Upgrading from v0.4.x to v0.5.0](#upgrading-from-v04x-to-v050)).
 
 What these policies do and do not isolate:
 
-- **CA key vs. server signer.** After migration (or on a v0.3.0 first install),
-  no LOCAL SERVICE process can open the CA key; only the server key is usable by
-  a non-privileged runtime.
+- **CA key vs. server signer.** On a first install since v0.3.0, no LOCAL
+  SERVICE process can open the CA key; only the server key is usable by a
+  non-privileged runtime.
 - **Shared LOCAL SERVICE identity.** The server key DACL grants the shared
   well-known LOCAL SERVICE SID (`S-1-5-19`), not a dedicated Agent identity.
   Every process running as LOCAL SERVICE on the machine can use the server
@@ -328,14 +351,10 @@ What these policies do and do not isolate:
   Administrators group is deny-only, so the `BA` entry does not apply: such a
   caller can open **neither** key. Authorization depends on the effective
   token, not on whether the account is an administrator.
-- **Before migration, the CA key is still exposed.** A legacy CA key keeps its
-  LOCAL SERVICE entry until `MigrateMachineKeyPolicies` succeeds. The v0.3.0
-  API refuses to use it, but any LOCAL SERVICE process can still open it
-  through the native CNG API. Upgrading the library **without** running the
-  migration does not mitigate that exposure.
-- **Open handles.** Rewriting the CA key DACL denies new opens; it is not
-  assumed to revoke handles that a process already holds. See the cutover
-  procedure in [Upgrading from v0.2.x to v0.3.0](#upgrading-from-v02x-to-v030).
+- **A legacy CA key stays exposed.** A CA key from a release before v0.3.0
+  keeps its LOCAL SERVICE entry. The API refuses to use it, but any LOCAL
+  SERVICE process can still open it through the native CNG API, and Local TLS
+  no longer tightens it in place.
 
 ### Privilege and access matrix
 
@@ -347,16 +366,15 @@ are listed in [Filesystem access](#filesystem-access).
 
 | Operation | Caller | Keys opened | TLS state directory | `LocalMachine\Root` |
 | --- | --- | --- | --- | --- |
-| `ProvisionMachine` (first install) | privileged | CA + server, created under their role policies | creates the directory; writes `ca-cert.der`, `server-cert.der` via temporaries + rename | installs the exact CA |
-| `ProvisionMachine` (existing state) | privileged | CA + server through the `MachineKeyStore` open-or-create seam | reads only | read-only verification |
+| `ProvisionMachine` (first install) | privileged | CA + server, created (never opened) under their role policies; deleted again, by recorded SPKI, if the install fails before both DERs are written | creates the directory; writes `ca-cert.der`, `server-cert.der` via temporaries + rename; removes them again on such a failure | installs the exact CA |
+| `ProvisionMachine` (existing state) | privileged | CA + server, open-only | reads only | read-only verification |
 | `ReloadMachine` | privileged | CA + server, open-only | reads `ca-cert.der`, `server-cert.der` | read-only verification |
 | `StageServerRenewal` | privileged | CA (signs) + server (verifies), open-only | reads DER; creates/replaces/deletes `server-cert.pending.der`; creates and removes `.localtls-tmp-*` | read-only verification |
-| `MigrateMachineKeyPolicies` | privileged | server (verify only), CA (DACL rewritten, then verified) | reads `ca-cert.der`, `server-cert.der` | not touched |
 | `LoadServingMaterial` | server key principal | server only | reads `ca-cert.der`, `server-cert.der` | read-only verification |
 | `LoadServingCandidate` | server key principal | server only | reads `ca-cert.der`, `server-cert.der`, `server-cert.pending.der` | read-only verification |
 | `ConfirmServingCandidate` | server key principal **and** filesystem rights | server only | reads all four files; writes `server-cert.prev.der` via temporary + rename; renames `server-cert.pending.der` over `server-cert.der`; on a retry after promotion may delete `server-cert.pending.der` | read-only verification |
 | `AbandonServingCandidate` | filesystem rights only | none | reads `server-cert.der`, `server-cert.pending.der`; deletes `server-cert.pending.der` | not touched |
-| `CleanupMachine`, `CleanupMachineBySHA256` | privileged | CA + server deleted by exact name | deletes the whole directory | removes the exact anchor |
+| `CleanupMachine`, `CleanupMachineBySHA256` | privileged | CA + server deleted by exact name, each verified against the SPKI of its certificate | reads both DERs first; deletes the whole directory only when everything is confirmed | removes the exact anchor |
 
 No serving or candidate path opens the CA key. Errors are not ordered by
 privilege: `ReloadMachine` reads the CA DER before it opens the CA key, and
@@ -365,9 +383,9 @@ leaf before it opens the CA key. A non-privileged caller may therefore get a
 file, validation or trust error first; `ErrPrivilegeRequired` is guaranteed
 only when the CA key open is reached, and that open is denied before any native
 key handle is obtained. `ErrPrivilegeRequired` from a key open comes from the
-`windowscng` check of the calling thread's token; `MigrateMachineKeyPolicies`
-and the first-install pre-check use Local TLS's own check of the process
-token. Both fail closed, but they can differ under impersonation.
+`windowscng` check of the calling thread's token; the first-install pre-check
+uses Local TLS's own check of the process token. Both fail closed, but they can
+differ under impersonation.
 
 ### Filesystem access
 
@@ -462,18 +480,23 @@ func ProvisionWithKeyStore(dataDir string, keyStore MachineKeyStore, trustStore 
   applies to it as well.
 
 The package also exports Windows-only test/smoke helpers (`TestCreateKey`,
-`TestOpenKey`, `TestDeleteKey`, `TestSignAndVerify`, `ProvisionSmoke`,
-`CleanupSmoke`, `VerifySmokeTrust`, `CleanupSmokeAnchorBySHA256`,
-`SmokeCAKeyName`, `SmokeServerKeyName`) scoped to the `Keppin.Test.*` namespace.
-These are testing surfaces, not production APIs; see
-[Smoke helpers](#smoke-helpers). They still use the policy-free `windowscng`
-API, which creates **every** test key with the service-signer DACL (LOCAL
-SERVICE included) and accepts only that form. They therefore do
-**not** follow the production key access policies: a smoke CA key is not
-privileged-only, as the source comment of `TestCreateKey` also states.
-Their name prefix check keeps them away from the production key names.
+`TestOpenKey`, `TestDeleteKey`, `TestKeySPKI`, `TestSignAndVerify`,
+`ProvisionSmoke`, `CleanupSmoke`, `VerifySmokeTrust`,
+`CleanupSmokeAnchorBySHA256`, `SmokeCAKeyName`, `SmokeServerKeyName`) scoped to
+the `Keppin.Test.*` namespace. These are testing surfaces, not production APIs;
+see [Smoke helpers](#smoke-helpers). They use the same `windowscng` primitives
+as production, with an explicit `PolicyServiceSigner` for **every** test key
+(LOCAL SERVICE included), so that a LOCAL SERVICE process can sign with a test
+key. They therefore do **not** follow the production key access policies: a
+smoke CA key is not privileged-only. `TestCreateKey` never adopts an existing
+key (`ErrKeyExists`), and `TestDeleteKey(name, expectedSPKI)` deletes only a
+key whose public key is the one recorded at creation (`TestKeySPKI`). Their
+name prefix check keeps them away from the production key names.
 
-The manual CLI `cmd/verify` wraps these helpers. Its `-open` operation reports
+The manual CLI `cmd/verify` wraps these helpers. `-create` prints the new
+key's DER SubjectPublicKeyInfo as `SPKI=<base64>`; `-delete` requires it,
+through exactly one of `-spki <base64>` or `-spki-file <path>` (a file holding
+the base64 text), and never falls back to opening the key. Its `-open` operation reports
 one of three outcomes, with exit codes that are the CLI's own contract (not
 Windows codes): `OPENED` (0, the open succeeded), `NOT_OPENABLE` (3, the error
 matches the structured `ErrKeyNotFound` sentinel) and `ERROR` (1, any other
@@ -503,9 +526,30 @@ conservative pre-check runs first and fails closed (policy) when:
 
 It then:
 
-1. creates or opens the persisted CA and server CNG keys;
+1. creates the persisted CA and server CNG keys, recording the
+   SubjectPublicKeyInfo of each right after its create; a key already persisted
+   under either name fails with `ErrKeyExists` and is never adopted, certified
+   or deleted;
 2. creates and persists public CA and server certificate DER only;
 3. installs the exact local CA into `LocalMachine\Root` (idempotent).
+
+A first install that fails before both DERs are persisted is rolled back: it
+releases its handles, removes any DER it wrote and deletes the keys it created,
+each through its recorded SubjectPublicKeyInfo (for example, if the server key
+already exists, only the new CA key is deleted). When that is not possible (a
+public key that could not be encoded, a delete that fails) the error also
+matches `ErrRollbackIncomplete`, keeps the primary cause, and names each key
+left behind by its role and, when its public key could be encoded, by the
+SHA-256 of its SPKI. A handle whose release fails is reported as
+`ErrKeyReleaseUnconfirmed`, with its role, and is not closed again; the
+rollback still deletes the keys this call created. A failure of the create itself leaves
+nothing this call owns: the CNG layer deletes the key of its own failed create,
+or reports `windowscng.ErrCleanupFailed` when it could not, and Local TLS does
+not delete it again. A failure to install the trust anchor after both DERs are
+persisted is **not** rolled back: the DERs are now the record of both keys, and
+`CleanupMachine` removes them with verified deletes. The same holds when, at
+that point, the release of the CA key handle is not confirmed
+(`ErrKeyReleaseUnconfirmed`): the trust anchor is then not installed.
 
 The first-install server certificate becomes the persisted certificate without
 consumer confirmation, because no previous certificate or consumer exists yet.
@@ -526,20 +570,22 @@ was renewed": a still-valid leaf inside `RenewalThreshold` is returned with a
   whose presence cannot be determined, fails closed with
   `ErrInconsistentMachineState`. The CA certificate is never reissued for
   existing state, and keys are never regenerated (policy; verified).
-- **Key acquisition on existing state.** Existing-state verification still
-  acquires keys through the `MachineKeyStore` open-or-create seam, so "writes no
-  DER" does not mean "never creates a key": a missing key name can be created as
-  a side effect, after which verification fails on the key mismatch. The runtime
-  and renewal paths open existing keys only.
+- **Keys on existing state.** Existing-state verification opens both keys and
+  never creates one.
 
 **First-install limits (residual risk, accepted under the single-writer
 contract):** the pre-check is a conservative gate, not proof that the CA key is
 absent — `ErrKeyNotFound` means "not found or not accessible" even for
-LocalSystem and Administrators. The check and the later open-or-create are not
-atomic, so there is no guarantee that the CA key certified on first install was
-created by that call. A first install interrupted after the DER writes but
-before trust installation leaves complete DER with `TrustAbsent`, which a later
-`ProvisionMachine` does not repair.
+LocalSystem and Administrators. A create never adopts a persisted key, but it
+does not reserve the name either: two overlapping creators can both succeed,
+the later key silently replacing the earlier one, so only the single-writer
+contract guarantees that the CA key certified on first install is the one that
+call created. A process that stops between a key create and the DER writes
+leaves a key without DER: a later `ProvisionMachine` fails closed with
+`ErrInconsistentMachineState` if the key opens, and no cleanup can delete it
+without its recorded SPKI (administrative recovery). A first install
+interrupted after the DER writes but before trust installation leaves complete
+DER with `TrustAbsent`, which a later `ProvisionMachine` does not repair.
 
 `LoadServingMaterial()` is the preferred serving-startup path:
 
@@ -558,10 +604,9 @@ before trust installation leaves complete DER with `TrustAbsent`, which a later
 - **requires a privileged caller** (LocalSystem or elevated Administrators),
   because it opens the privileged-only CA key to prove that it matches the CA
   certificate. When it reaches the CA key open, a non-privileged caller gets
-  `ErrPrivilegeRequired` without a key handle being obtained, and a CA key that
-  still has the legacy DACL gets `ErrKeyPolicyMismatch` until
-  `MigrateMachineKeyPolicies` has run. Earlier errors (CA DER missing or
-  unreadable) are returned first;
+  `ErrPrivilegeRequired` without a key handle being obtained, and a CA key whose
+  DACL is not exactly privileged-only gets `ErrKeyPolicyMismatch`. Earlier
+  errors (CA DER missing or unreadable) are returned first;
 - opens **both** the CA and server keys (open-only, never creates);
 - applies the same certificate, validity and trust checks;
 - never writes and never mutates `LocalMachine\Root`;
@@ -599,7 +644,6 @@ due).
 | Normal serving startup or reload | `LoadServingMaterial()` | Server key principal (e.g. LOCAL SERVICE); opens server key only; never writes; no trust mutation |
 | Full-state verification | `ReloadMachine()` | Privileged (CA key); opens CA + server keys; never writes; reports `ErrRenewalDue`; no trust mutation |
 | Server-certificate renewal | `StageServerRenewal()` (privileged) → `LoadServingCandidate(ref)` (server key principal) → consumer activation/attestation → `ConfirmServingCandidate(ref)` (server key principal + filesystem rights) or `AbandonServingCandidate(ref)` (filesystem rights) | No trust mutation; opens existing keys only; writes public DER only |
-| Tighten legacy key ACLs | `MigrateMachineKeyPolicies()` | Privileged; rewrites the CA key DACL in place (tighten-only, idempotent); never rotates keys, writes DER or touches trust |
 | Exact cleanup (DER available) | `CleanupMachine()` | Privileged; destructive |
 | Cleanup by fingerprint | `CleanupMachineBySHA256(fp)` | Privileged; destructive |
 
@@ -854,14 +898,22 @@ neither is guaranteed to restore service:
 
 ## Cleanup behavior
 
-`CleanupMachine()` and `CleanupMachineBySHA256(fp)` remove, in order, on a
+`CleanupMachine()` and `CleanupMachineBySHA256(fp)` first read `ca-cert.der`
+and `server-cert.der`, before anything changes, and then remove, in order, on a
 best-effort basis across independently removable artifacts:
 
 1. the exact local CA trust anchor from `LocalMachine\Root`;
-2. the exact local CA CNG key;
-3. the exact local server CNG key;
+2. the exact local CA CNG key, verified against the SubjectPublicKeyInfo of the
+   CA certificate;
+3. the exact local server CNG key, verified against the SubjectPublicKeyInfo
+   of the server certificate;
 4. the Local TLS state directory (`...\Agent\tls`), including the pending and
    backup files.
+
+The certificates are the recorded identities of the keys. A key is never
+identified by opening its name, and the CA fingerprint passed to
+`CleanupMachineBySHA256` identifies a certificate, not a key: it never
+authorizes a key delete.
 
 Failure semantics:
 
@@ -870,20 +922,33 @@ Failure semantics:
   so no security-sensitive artifact failure is silently swallowed (verified);
 - an already-absent trust anchor (`ErrTrustAnchorNotFound`) or state directory
   is idempotent success;
+- a key whose certificate DER is missing, unreadable or does not parse is
+  **not deleted**: its deletion is reported as `ErrKeyDeletionNotCompletable`,
+  and the other key is still processed. With `CleanupMachineBySHA256`, a CA DER
+  on disk whose fingerprint is not `fp` is a conflict: it is not used to delete
+  the CA key, which is reported the same way;
+- a key that does not hold its role policy or the recorded public key is not
+  deleted (`ErrDeleteVerificationFailed`);
 - a key delete that reports `ErrKeyNotFound` (not found **or not accessible**)
   is **not** a confirmed deletion: it is returned as `ErrKeyDeletionUnconfirmed`
-  (which also matches `ErrKeyNotFound`), and the state directory, including the
-  CA DER, is then retained for diagnosis and a retried cleanup (verified).
-  Cleanup returns `nil` only when both key deletions were confirmed, so a
-  repeated cleanup reports an unconfirmed deletion;
+  (which also matches `ErrKeyNotFound`);
+- the state directory, with the DERs that identify the trust anchor and the
+  keys, is removed only when the trust anchor removal **and** both key
+  deletions are confirmed; otherwise it is retained for diagnosis and a retried
+  cleanup (verified). Cleanup returns `nil` only then;
+- a cleanup repeated after a complete one finds no DER, deletes no key and
+  reports `ErrKeyDeletionNotCompletable`; a cleanup retried after a partial one
+  can report a key it already deleted as `ErrKeyDeletionUnconfirmed`. Without a
+  journal Local TLS cannot tell those cases from a key it cannot access: do not
+  treat them as success and do not remove the retained directory automatically;
 - cleanup never deletes by subject/CN, wildcard, prefix, or unrelated parent
   directory.
 
-`CleanupMachine` needs the on-disk CA DER to identify the trust anchor. If the
-state directory (and thus the DER) is already gone, use
-`CleanupMachineBySHA256` with the known fingerprint. Cleanup removes only the
-anchor identified by that DER or fingerprint; it does not search for other
-historical anchors.
+`CleanupMachine` needs the on-disk CA DER to identify the trust anchor. If it is
+gone, use `CleanupMachineBySHA256` with the known fingerprint; without the DERs
+the keys cannot be deleted by Local TLS and need an authorized administrative
+recovery. Cleanup removes only the anchor identified by that DER or fingerprint;
+it does not search for other historical anchors.
 
 ### Smoke helpers
 
@@ -891,12 +956,11 @@ historical anchors.
 `Keppin.Test.Smoke.*` key names only; they require Administrator elevation.
 `CleanupSmoke` follows the same contract as production cleanup:
 
-- **An error does not mean nothing was cleaned up.** When both smoke key
-  deletions are confirmed, removal of the smoke root is attempted even if
-  trust-anchor removal failed; the trust error is still returned with the root
-  (and its CA DER) gone. Preserve the exact CA DER or its fingerprint outside the
-  smoke root if trust removal may need a retry; the fingerprint works with
-  `CleanupSmokeAnchorBySHA256`.
+- **An error does not mean nothing was cleaned up.** The smoke root, with its
+  DERs, is removed only when the trust anchor removal and both key deletions
+  are confirmed; each smoke key is deleted only through the SPKI of its
+  certificate in the smoke root, and a smoke CA DER that is not `caCertDER`
+  does not identify the CA key.
 - **A retry may never return nil.** An ambiguous `ErrKeyNotFound` keeps
   producing `ErrKeyDeletionUnconfirmed` and the root is retained; do not treat
   that as a confirmed deletion.
@@ -921,25 +985,32 @@ historical anchors.
   `ErrPromotionUnconfirmed`) are described in
   [Server-certificate renewal](#server-certificate-renewal).
 - In cleanup only `ErrTrustAnchorNotFound` is idempotent success;
-  `ErrKeyNotFound` is reported as `ErrKeyDeletionUnconfirmed`.
+  `ErrKeyNotFound` is reported as `ErrKeyDeletionUnconfirmed`, a missing key
+  identity as `ErrKeyDeletionNotCompletable`.
+- `ErrKeyExists`: a first install found a key already persisted under a Local
+  TLS name. The key was not touched. It is never a reason to delete that key or
+  to retry with another name; inspect the machine.
+- `ErrRollbackIncomplete`: a failed first install left a key or a DER behind;
+  the error names each one. Recover administratively before a new first
+  install.
 - `ErrPrivilegeRequired`: the caller's token is not privileged, or its
   privilege could not be determined. It is not guaranteed to be the first error
   a non-privileged caller sees (see
   [Privilege and access matrix](#privilege-and-access-matrix)). Do not respond
   by elevating a serving runtime; use the serving APIs instead.
-- `ErrKeyPolicyMismatch`: the key DACL is not exactly its role policy. On a CA
-  key this usually means the key-ACL migration has not run; any other DACL needs
-  administrative inspection. The key is never modified as a side effect.
+- `ErrKeyPolicyMismatch`: the key DACL is not exactly its role policy (on a CA
+  key, for example, the service-signer DACL of a release before v0.3.0). It
+  needs administrative inspection; the key is never modified as a side
+  effect.
 
 ## Security model
 
 - Private keys are machine-scoped CNG keys and never persisted as files; the
   module never handles private-key bytes.
-- The CA key is privileged-only on a v0.3.0 first install and after
-  `MigrateMachineKeyPolicies`: no LOCAL SERVICE process can then open it or
-  sign with it, and only the server key is usable by the non-privileged
-  runtime. **Before** the migration a legacy CA key stays open to every LOCAL
-  SERVICE process, whatever library version is installed (see
+- The CA key is privileged-only on every first install since v0.3.0: no LOCAL
+  SERVICE process can open it or sign with it, and only the server key is
+  usable by the non-privileged runtime. A legacy CA key from an earlier release
+  stays open to every LOCAL SERVICE process (see
   [Key access policies](#key-access-policies)).
 - The server signing key is shared by every LOCAL SERVICE process on the
   machine; Local TLS does not isolate the Agent from them.
@@ -963,7 +1034,7 @@ historical anchors.
   `Close()` (caller responsibility).
 - The CA signer is a transient internal handle, used for issuer/renewal signing
   and to verify that the persisted CA certificate matches the CA key (reload,
-  existing-state provisioning, staging and `MigrateMachineKeyPolicies`). It is
+  existing-state provisioning and staging). It is
   never transferred to the caller and is released internally.
 - `Close()` releases the process-local CNG handle only. It never deletes a
   persisted key, never removes certificates or trust anchors, and never triggers
@@ -971,78 +1042,37 @@ historical anchors.
 - `Close()` is idempotent in effect (verified). After `Close()`, the serving
   certificate must not be used for new handshakes.
 - With `github.com/keppin-oss/cng` v0.2.1 and later (this module requires
-  v0.3.1), the first `Close()` may return an error if a native handle cannot be
+  v0.5.1), the first `Close()` may return an error if a native handle cannot be
   released; the release is not retried, and repeated calls are harmless and
   return `nil`. The CNG signer serializes `Sign` and `Close`, but `Close()` does
   not drain callers: close a `Material` only when no handshake can use it any
   longer.
-- Since `github.com/keppin-oss/cng` v0.2.2, when a key open-or-create call
-  creates a **new** key and then fails to verify it or to build its signer
-  (public-key export), the CNG layer attempts once to delete that new key,
-  through the handle it created, instead of leaving it behind. If that deletion
-  fails, the CNG error also matches `windowscng.ErrCleanupFailed`. These error
-  paths never delete existing keys or keys that are only opened.
-  - Within Local TLS, open-or-create is reached through the `MachineKeyStore`
-    seam by `ProvisionMachine` first install (the intended creation path) and
-    by `ProvisionWithKeyStore`, including its existing-state verification,
-    which can create a missing key name as a side effect (see
-    [Provisioning flow](#provisioning-flow)). The test helper `TestCreateKey`
-    calls `windowscng.LoadOrCreate` directly, outside that seam. The runtime
-    and renewal paths open existing keys only.
-  - The rollback covers only the key created by that call: a CA key created
-    earlier in the same provisioning is not removed (see the first-install
-    limits in [Provisioning flow](#provisioning-flow)).
-  - Local TLS maps the CNG errors before returning them. `ErrCleanupFailed`
-    stays matchable with `errors.Is` when the error is classified as
-    `ErrKeyPolicyMismatch` or `ErrPrivilegeRequired`, or passed through
-    unchanged. An error classified as `ErrKeyNotFound` keeps the original
-    error as text only, so a chain carrying both `windowscng.ErrKeyNotFound`
-    and `ErrCleanupFailed` would lose the latter for `errors.Is`. The native
-    cng v0.2.2 rollback paths used by the production key store did not produce
-    that combination. The limit applies only to an error that actually goes
-    through `mapCNGError`, such as a synthetic error injected through the
-    internal CNG seam in tests or an adapter that calls the mapper; errors of
-    a custom `MachineKeyStore` are propagated as returned, not mapped. A future
-    cng version may need re-evaluation; this was not re-verified against
-    v0.3.1.
-  - Since `github.com/keppin-oss/cng` v0.3.0, a **non-privileged** caller whose
-    `NCryptFinalizeKey` is denied with `NTE_PERM`, followed by a delete of the
-    never finalized key that reports `NTE_BAD_KEYSET`, no longer produces
-    `windowscng.ErrCleanupFailed`: the key was not persisted and the error is
-    the finalize denial alone. Every other combination, including the same
-    statuses for a privileged caller, still wraps `ErrCleanupFailed`. This was
-    verified natively by cng on a single configuration only (Windows NT
-    10.0.26200, Microsoft Software KSP); it has not been validated by
-    Local TLS against a live KSP.
-  - Since cng v0.3.0 the native failures are typed (`*windowscng.NCryptError`
-    with `Op` and `Code`, reachable with `errors.As`; `Op` is descriptive only
-    and must not be compared) and `windowscng.ErrPostWriteVerification` is
-    public. `mapCNGError` still classifies only by the cng sentinels:
-    a bare native error is never converted to `ErrKeyNotFound`, and an
-    error that matches `ErrPostWriteVerification` (a DACL was written but could
-    not be confirmed; nothing is rolled back) is passed through unchanged, so
-    callers must not retry or regenerate keys automatically after it.
-  - Since cng v0.3.1, a persisted security-descriptor read that reports 0 bytes
-    written, and an Export Policy read whose reported size is not exactly 4
-    bytes, fail closed: the key is not opened and no signer is returned. The
-    0-byte descriptor on the policy path no longer wraps
-    `windowscng.ErrPolicyMismatch`, so it is not reported as
-    `ErrKeyPolicyMismatch`; it is passed through as an unclassified error.
-    This applies to a read that fails before any DACL write. If the read fails
-    after the write, cng reports `windowscng.ErrPostWriteVerification`
-    instead (see the previous item): the DACL is persisted but unconfirmed and
-    nothing is rolled back.
-  - cng v0.3.1 states that provisioning and policy changes on the same key must
-    be serialized by the caller, also across processes, and that the package
-    does not guarantee tighten-only transitions with concurrent writers. This
-    reinforces the single-writer contract of `ProvisionMachine`,
-    `MigrateMachineKeyPolicies` and cleanup: one lifecycle coordinator per
-    machine must not run them concurrently.
-  - Public-key export errors instead of panicking when the provider reports a
-    zero query size, zero bytes written, or more bytes written than the
-    buffer holds, and when the written blob is invalid or truncated. A valid
-    blob shorter than the queried size is accepted.
-  - None of these behaviors has been validated against a live KSP.
+- Behavior of `github.com/keppin-oss/cng` v0.5.1 that Local TLS relies on:
+  - `Create` calls `NCryptCreatePersistedKey` without the overwrite flag, with
+    no prior open: `NTE_EXISTS` is `ErrKeyExists` and nothing is touched. When
+    the key it created fails its checks or its signer cannot be built, cng
+    deletes that key through the same handle; if that delete fails, the error
+    also matches `windowscng.ErrCleanupFailed` and the key may persist. Local
+    TLS keeps that chain and never deletes such a key again.
+  - `Open` and `Create` export the public key once and build the signer on it.
+  - `Delete` verifies the export policy, the key profile, the DACL and the
+    public key against the expected SPKI on the handle it deletes, and deletes
+    through that handle. It is not a transaction against a concurrent writer.
+  - Native reads are bounded (signature 64 bytes, public key 72 bytes, DACL-only
+    descriptor 128 KiB); a provider reporting more is refused, never reported as
+    `ErrPolicyMismatch`.
+  - Native failures are typed (`*windowscng.NCryptError` with `Op` and `Code`,
+    reachable with `errors.As`; `Op` is descriptive only and must not be
+    compared). `mapCNGError` classifies only by the cng sentinels: a bare native
+    error is never converted to `ErrKeyNotFound`.
+  - Provisioning, deletion and policy changes on the same key name must be
+    serialized by the caller, also across processes. This is the single-writer
+    contract of `ProvisionMachine` and cleanup.
+  - The native create, open, sign, export and delete paths of cng v0.5.1 were
+    validated by cng on Windows 11 Pro and Windows Server 2025 with the
+    Microsoft Software KSP. Local TLS v0.5.0 was validated live on the same two
+    systems (see
+    [Windows validation of v0.5.0](#windows-validation-of-v050)).
 - `Material` is single-owner; do not copy it by value and reuse the copy after
   `Close`.
 
@@ -1100,7 +1130,13 @@ Windows, `go test ./...` is **not** a safe, all-green suite:
   `Keppin.Test.Smoke.elevation-probe-*` key.
 - The trust-store tests `TestTrustStoreInstallAndVerify`,
   `TestTrustStoreConflictingCert` and `TestRemoveNonExistent` use
-  `LocalMachine\Root` directly and are not elevation-gated.
+  `LocalMachine\Root` directly. The first two decide from the caller's token,
+  before any write, whether their install and removal steps run: a
+  privileged caller (LocalSystem or an elevated Administrators member) runs
+  them and they must succeed; any other caller skips them (NOT EXECUTED), or
+  fails when `KEPPIN_TRUST_ELEVATED_REQUIRED=1`. Each removes its exact test
+  certificate at the end, also when it fails. `TestRemoveNonExistent` is not
+  elevation-gated.
 - `TestTrustStoreEmptyDER` and `TestPlatformTrustStoreReturnsStore` do **not**
   open the real trust store: the platform constructor only returns a struct,
   and empty input is rejected before `LocalMachine\Root` is opened. They are
@@ -1121,6 +1157,24 @@ go test ./... -skip '^(TestTrustStoreInstallAndVerify|TestTrustStoreConflictingC
 
 Report results of the safe suite and of the machine tests separately; do not
 describe a run of the full suite as green.
+
+The GitHub Actions workflow (`.github/workflows/ci.yml`) runs on every pull
+request and on every push to `main` of the public `keppin-oss` repository; in
+any other copy its jobs are skipped:
+
+- **Windows** (`windows-latest`): build, `go vet` for amd64 and 386, and
+  `go test ./... -count=1 -v`. The runner's token is elevated, so the
+  `LocalMachine\Root` tests run on the disposable runner, with
+  `KEPPIN_TRUST_ELEVATED_REQUIRED=1` so that a non-privileged token fails the
+  job instead of skipping them. CI sets neither `KEPPIN_SMOKE_DIAG_DIR` nor
+  `KEPPIN_SERVING_CLOSE_DIAG_DIR`, so no test creates a machine CNG key. The verbose
+  log names each of these tests as PASS or SKIP.
+- **Linux** (`ubuntu-latest`): `gofmt -l .` (the job fails if it lists a file),
+  build, vet and test.
+
+Check formatting on the committed files or on Linux. With
+`core.autocrlf=true`, `gofmt -l` on a Windows working tree also lists files
+whose only difference is CRLF line endings.
 
 Elevated Windows validation for the CNG / trust-store / cleanup lifecycle runs
 from an elevated shell on a disposable Windows environment:
@@ -1164,12 +1218,50 @@ flows requiring elevation, machine CNG state, and `LocalMachine\Root` mutation
 are reported **NOT EXECUTED** in unprivileged environments and must be validated
 manually on a disposable Windows environment.
 
-The key access policies, the role separation and the key-ACL migration are
-covered offline by fake-based and structural tests (`TestKeyPolicy*`,
-`TestProductionKeyOperations*`, `TestAgentRole*`, `TestCARolePathsFailClosed`,
-`TestLegacyServingCompatibleBeforeMigration`, `TestMigrateKeyPolicies*`,
-`TestProductionCodeAvoidsLegacyPolicyFreeCNG`), which touch no real key, ACL or
-trust store.
+The key access policies, the role separation, the open/create separation, the
+first-install rollback and the verified cleanup are covered offline by
+fake-based and structural tests (`TestKeyPolicy*`,
+`TestProductionKeyOperations*`, `TestMapCNGError*`, `TestAgentRole*`,
+`TestCARolePathsFailClosed`, `TestServingIndependentOfCAKeyPolicy`,
+`TestFirstInstall*`, `TestCleanupLocalTLS*`, `TestNoRemovedKeyLifecycleInCode`),
+which touch no real key, ACL or trust store.
+
+### Windows validation of v0.5.0
+
+v0.5.0 was validated live with the Microsoft Software KSP on two disposable
+machines, Windows 11 Pro 25H2 (build 26200) and Windows Server 2025 Standard
+24H2 (build 26100), with test-only key names. On each machine:
+
+- the baseline (no `Keppin Local Root CA` anchor, no `Keppin.Test.*` or Local
+  TLS production key, no `%ProgramData%\Keppin`) was checked before the run,
+  after the elevated suite and at the end, and was clean each time;
+- the offline suite passed with a non-elevated token, skipping only the four
+  privileged or live tests;
+- the full suite passed elevated, with `KEPPIN_TRUST_ELEVATED_REQUIRED=1`,
+  both live tests enabled and no test skipped: both trust-store tests, the two
+  smoke lifecycle cycles and the serving-close test, whose key was deleted with
+  a verified delete;
+- `cmd/verify` behaved as expected with three principals. With an elevated
+  token: create (prints the SPKI), create on the same name (`ErrKeyExists`, key
+  unchanged), open, delete with another P-256 key's SPKI
+  (`ErrDeleteVerificationFailed`, exit 1, key kept), delete with no `-spki`
+  flag, with an empty value or with malformed base64 (exit 2 in each case, no
+  CNG call, key kept) and delete with the recorded SPKI. With a non-elevated
+  token: `NOT_OPENABLE`. As LOCAL SERVICE: open and sign.
+
+Limits of that validation:
+
+- It ran on a pre-release tree with the same production logic as the
+  published one. The published tree differs in the module path, in
+  documentation and formatting, and in the internal names of the serving-close
+  test, its environment variable and key prefix.
+- On Windows Server 2025 the commands ran through PowerShell Remoting as the
+  built-in Administrator, whose token UAC does not filter: the non-elevated runs
+  used a restricted token (`runas /trustlevel`) at high integrity. The
+  UAC-filtered, medium-integrity case was covered on Windows 11 only.
+- LOCAL SERVICE ran from a temporary scheduled task, not from a Service
+  Control Manager service. Impersonation, other key storage providers and other
+  Windows builds were not covered.
 
 ### Windows validation of the key policies
 
@@ -1199,7 +1291,8 @@ declared validated):
   upgrade or v0.3.0 → v0.2.x downgrade was run.
 - Renewal timing was injected rather than waited for; LOCAL SERVICE came from
   a scheduled task, not a Service Control Manager service.
-- The test helpers keep their legacy DACL (see
+- At that time the test helpers used the legacy policy-free API; they now use
+  an explicit service-signer policy (see
   [Lower-level seam and testing APIs](#lower-level-seam-and-testing-apis)).
 - Test and production CAs share the CN `Keppin Local Root CA`: a leftover test
   anchor in `LocalMachine\Root` makes `VerifyTrust` report `TrustConflict` for
@@ -1254,11 +1347,13 @@ were not triggered live.
   SERVICE process, not only by the Agent.
 - **No filesystem ACL enforcement** — the TLS state directory ACLs are set by
   the installer/updater.
-- **No implicit key-ACL migration** — a legacy CA key stays exposed to LOCAL
-  SERVICE until `MigrateMachineKeyPolicies` is run explicitly.
-- **Existing-state provisioning uses open-or-create** — acceptable only under
-  the single-writer contract; the open-only probe before it is not an atomic
-  guarantee.
+- **No key-ACL migration** — a legacy CA key from a release before v0.3.0 is
+  never tightened by Local TLS and needs an administrative recovery.
+- **No durable record between a key create and the DER writes** — a process
+  that stops in that window leaves a key that Local TLS cannot delete; the
+  journal for that window is out of scope.
+- **A create does not reserve the key name** — only the single-writer contract
+  excludes two overlapping creators.
 - The module does not provide a generic TLS/PKI or trust-store framework.
 
 ## Troubleshooting
@@ -1267,26 +1362,56 @@ were not triggered live.
    explicit unsupported-platform errors.
 2. **Provisioning** — was `ProvisionMachine()` already run (elevated)? Serving
    startup requires previously persisted machine material.
-3. **Privilege** — provisioning, `ReloadMachine`, staging, migration and
-   cleanup require LocalSystem or an elevated Administrator
+3. **Privilege** — provisioning, `ReloadMachine`, staging and cleanup require
+   LocalSystem or an elevated Administrator
    (`ErrPrivilegeRequired`). Serving does not, but the process token must be
    authorized by the server key DACL: LOCAL SERVICE is, a UAC-filtered
    Administrator is not.
-4. **Key policy** — `ErrKeyPolicyMismatch` on the CA key after an upgrade from
-   v0.2.x means the key-ACL migration has not run; see
-   [Upgrading from v0.2.x to v0.3.0](#upgrading-from-v02x-to-v030). On any other
-   key or DACL, inspect manually; never widen a DACL to make an open succeed.
-5. **Trust** — `TrustAbsent` / `TrustConflict` fails closed with
+4. **Key policy** — `ErrKeyPolicyMismatch` means the key DACL is not exactly
+   its role policy (on a CA key, possibly a legacy DACL from before v0.3.0).
+   Inspect manually; never widen a DACL to make an open succeed.
+5. **Existing key** — `ErrKeyExists` on a first install means a key is already
+   persisted under a Local TLS name without its certificates. Inspect it; never
+   delete it by name to make the install proceed.
+6. **Trust** — `TrustAbsent` / `TrustConflict` fails closed with
    `ErrTrustNotHealthy`; re-running `ProvisionMachine` does not repair it. See
    [Trust states and recovery](#trust-states-and-recovery). Do not weaken trust
    checks and do not auto-remove a conflicting anchor.
-6. **Inconsistent state** — `ErrInconsistentMachineState` is never resolved
+7. **Inconsistent state** — `ErrInconsistentMachineState` is never resolved
    automatically; inspect the state directory and keys before any cleanup.
-7. **Renewal** — `ErrRenewalDue` means "run the staged renewal flow". A
+8. **Renewal** — `ErrRenewalDue` means "run the staged renewal flow". A
    successful `ProvisionMachine` does not mean the certificate was renewed. An
    expired certificate fails closed in `LoadServingMaterial` until a candidate is
    staged, activated, attested and confirmed.
-8. **Sentinels** — match with `errors.Is`, never on message text.
+9. **Sentinels** — match with `errors.Is`, never on message text.
+
+## Upgrading from v0.4.x to v0.5.0
+
+v0.5.0 is a **breaking** release with no compatibility layer. Under SemVer
+pre-1.0 (`0.y.z`) a breaking change is carried by a minor version. The
+persisted identities (key names, directory and file names) are unchanged.
+
+| Area | v0.4.x | v0.5.0 |
+| --- | --- | --- |
+| CNG dependency | `github.com/keppin-oss/cng v0.3.1` | `v0.5.1` |
+| `MachineKeyStore` | `LoadOrCreateCAKey`, `LoadOrCreateServerKey` (open, or create when not found) | `OpenCAKey`, `OpenServerKey` (never create), `CreateCAKey`, `CreateServerKey` (never adopt, `ErrKeyExists`), plus `MachineKeyDeleter` |
+| `MachineKeyDeleter` | `DeleteCAKey()`, `DeleteServerKey()` by name | `DeleteCAKey(expectedSPKI)`, `DeleteServerKey(expectedSPKI)`, verified against the recorded public key |
+| First install | opened an existing key and certified it | creates both keys; an existing key fails with `ErrKeyExists`; a failure before both DERs are written is rolled back (`ErrRollbackIncomplete` when it cannot be) |
+| Existing-state `ProvisionMachine` | open-or-create | open-only |
+| Cleanup | deleted the keys by name; removed the directory even if trust removal failed | verified deletes from the SPKI of the DERs read first; a missing DER is `ErrKeyDeletionNotCompletable`; the directory is kept unless trust and both keys are confirmed |
+| `MigrateMachineKeyPolicies` | tightened a legacy CA key in place | **removed**, with its stub |
+| Test helpers, `cmd/verify` | policy-free legacy API; `TestDeleteKey(name)`; `-delete` by name | explicit service-signer policy; `TestDeleteKey(name, expectedSPKI)`, `TestKeySPKI`; `-create` prints the SPKI, `-delete` requires `-spki` or `-spki-file` |
+| Errors | the cng sentinel was dropped from an `ErrKeyNotFound` chain | every mapped error keeps the cng sentinel and native error; new sentinels `ErrKeyExists`, `ErrDeleteVerificationFailed`, `ErrKeyDeletionNotCompletable`, `ErrRollbackIncomplete`, `ErrKeyReleaseUnconfirmed` |
+
+An implementation of `MachineKeyStore` or `MachineKeyDeleter` must provide the
+new methods. A cleanup that returns `ErrKeyDeletionUnconfirmed`,
+`ErrKeyDeletionNotCompletable` or `ErrDeleteVerificationFailed` is incomplete,
+never a success (see [Cleanup behavior](#cleanup-behavior)).
+
+An installation whose CA key still carries the service-signer DACL of a release
+before v0.3.0 can no longer be migrated in place: every path that needs the CA
+key fails with `ErrKeyPolicyMismatch`, and the verified delete refuses it too.
+It needs an authorized administrative recovery before a new first install.
 
 ## Upgrading from v0.3.x to v0.4.0
 
@@ -1341,6 +1466,10 @@ library behavior changes only on error paths, through cng v0.2.2.
   (see [Validation](#validation)).
 
 ## Upgrading from v0.2.x to v0.3.0
+
+> `MigrateMachineKeyPolicies`, described below, was removed in
+> [v0.5.0](#upgrading-from-v04x-to-v050). This section is kept as the record of
+> the v0.3.0 upgrade.
 
 v0.3.0 is a **breaking** release. Under SemVer pre-1.0 (`0.y.z`) a breaking
 change is carried by a minor version, so the module path and major version are

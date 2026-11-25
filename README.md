@@ -29,8 +29,8 @@ import "github.com/keppin-oss/local-tls"
 
 Package `localtls`. Provision once (elevated), then serve with
 `LoadServingMaterial` from a principal the server key authorizes (for example
-LOCAL SERVICE). `ReloadMachine`, `StageServerRenewal`,
-`MigrateMachineKeyPolicies` and cleanup are administrative operations; see the
+LOCAL SERVICE). `ReloadMachine`, `StageServerRenewal` and cleanup are
+administrative operations; see the
 [privilege and access matrix](docs/README.md#privilege-and-access-matrix).
 See [`examples/`](examples/):
 
@@ -40,6 +40,12 @@ See [`examples/`](examples/):
 
 ## Upgrading
 
+- **From v0.4.x to v0.5.0** — breaking: the module requires
+  `github.com/keppin-oss/cng` v0.5.1; the key store separates open and create
+  (`OpenCAKey`/`CreateCAKey`, never open-or-create), key deletes are verified
+  against the public key recorded in the certificates, and
+  `MigrateMachineKeyPolicies` is removed. See
+  [Upgrading from v0.4.x to v0.5.0](docs/README.md#upgrading-from-v04x-to-v050).
 - **From v0.3.x to v0.4.0** — one new exported error, `ErrCANotConstrained`: the CA
   is now issued with name constraints and a serverAuth-only EKU, and a CA from
   v0.3.1 or earlier is rejected, fail-closed, until it is replaced with cleanup
@@ -50,10 +56,8 @@ See [`examples/`](examples/):
   now requires `github.com/keppin-oss/cng` v0.2.2. See
   [Upgrading from v0.3.0 to v0.3.1](docs/README.md#upgrading-from-v030-to-v031).
 - **From v0.2.x to v0.3.0** — breaking: `ReloadMachine` and
-  `StageServerRenewal` now require a privileged caller, and existing
-  installations need an explicit, privileged `MigrateMachineKeyPolicies()` run
-  by the installer/updater. Upgrading the library alone does not protect a
-  legacy CA key. See
+  `StageServerRenewal` now require a privileged caller. The in-place key-ACL
+  migration that v0.3.0 provided has since been removed. See
   [Upgrading from v0.2.x to v0.3.0](docs/README.md#upgrading-from-v02x-to-v030).
 - **From v0.1.x** — v0.2.0 has breaking behavior changes; see
   [Upgrading from v0.1.x](docs/README.md#upgrading-from-v01x).

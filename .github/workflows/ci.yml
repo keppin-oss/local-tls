@@ -1,0 +1,82 @@
+name: ci
+
+# Default test suite. On the Windows runner the token is elevated, so the
+# LocalMachine\Root tests run there: KEPPIN_TRUST_ELEVATED_REQUIRED=1 makes them
+# fail instead of skipping if the token is not privileged. The live tests with
+# real machine CNG keys run only when KEPPIN_SMOKE_DIAG_DIR or
+# KEPPIN_SERVING_CLOSE_DIAG_DIR is set, and CI sets neither. Live validation is done
+# separately.
+#
+# The jobs run only in the public keppin-oss repository. In any other copy of
+# the repository they are skipped.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    if: github.repository_owner == 'keppin-oss'
+    runs-on: windows-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: go version
+        run: go version
+      - name: build
+        run: go build ./...
+      - name: vet (amd64)
+        run: go vet ./...
+      - name: vet (386)
+        run: GOARCH=386 go vet ./...
+      - name: test
+        # Verbose, so the log names each elevated or live test as PASS or SKIP.
+        env:
+          KEPPIN_TRUST_ELEVATED_REQUIRED: "1"
+        run: go test ./... -count=1 -v
+
+  linux:
+    if: github.repository_owner == 'keppin-oss'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: go version
+        run: go version
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt reports:"
+            echo "$unformatted"
+            exit 1
+          fi
+      - name: build
+        run: go build ./...
+      - name: vet
+        run: go vet ./...
+      - name: test
+        run: go test ./... -count=1

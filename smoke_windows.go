@@ -4,6 +4,7 @@ package localtls
 
 import (
 	"crypto"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -15,23 +16,28 @@ import (
 
 const smokeKeyPrefix = identity.SmokeKeyNamespace
 
-// smokeKeyStore implements MachineKeyStore but enforces the
-// Keppin.Test.Smoke. key-name prefix on all operations.
-// It delegates to TestCreateKey (which already enforces Keppin.Test.).
+// smokeKeyStore implements MachineKeyStore on exactly the two smoke key names,
+// in the Keppin.Test.Smoke. namespace. It delegates to TestOpenKey,
+// TestCreateKey and TestDeleteKey (which enforce Keppin.Test.), so the smoke
+// keys use the service-signer policy for both roles.
 type smokeKeyStore struct{}
 
-func (s smokeKeyStore) LoadOrCreateCAKey() (crypto.Signer, error) {
-	return TestCreateKey(SmokeCAKeyName)
-}
-
-func (s smokeKeyStore) LoadOrCreateServerKey() (crypto.Signer, error) {
+func (s smokeKeyStore) OpenCAKey() (crypto.Signer, error)     { return TestOpenKey(SmokeCAKeyName) }
+func (s smokeKeyStore) OpenServerKey() (crypto.Signer, error) { return TestOpenKey(SmokeServerKeyName) }
+func (s smokeKeyStore) CreateCAKey() (crypto.Signer, error)   { return TestCreateKey(SmokeCAKeyName) }
+func (s smokeKeyStore) CreateServerKey() (crypto.Signer, error) {
 	return TestCreateKey(SmokeServerKeyName)
 }
 
 // DeleteCAKey and DeleteServerKey make smokeKeyStore a MachineKeyDeleter for
-// exactly the two smoke key names.
-func (s smokeKeyStore) DeleteCAKey() error     { return TestDeleteKey(SmokeCAKeyName) }
-func (s smokeKeyStore) DeleteServerKey() error { return TestDeleteKey(SmokeServerKeyName) }
+// exactly the two smoke key names, verified against the recorded public key.
+func (s smokeKeyStore) DeleteCAKey(spki []byte) error {
+	return TestDeleteKey(SmokeCAKeyName, spki)
+}
+
+func (s smokeKeyStore) DeleteServerKey(spki []byte) error {
+	return TestDeleteKey(SmokeServerKeyName, spki)
+}
 
 // Smoke key names — explicitly in the Keppin.Test.* namespace.
 const (
@@ -56,9 +62,10 @@ func validateSmokeKeyName(name string) error {
 // Requires Administrator elevation (creates machine-scoped CNG keys and
 // installs the test CA in LocalMachine\Root).
 //
-// Repeated provisioning with the same root is idempotent: the same CA
-// identity is preserved and the CA certificate is not re-installed if
-// already present.
+// A first provisioning creates both smoke keys and never adopts an existing
+// one (ErrKeyExists). Repeated provisioning with the same root opens the
+// existing keys: the same CA identity is preserved and the CA certificate is
+// not re-installed.
 func ProvisionSmoke(rootDir string) (Material, error) {
 	if err := validateSmokeKeyName(SmokeCAKeyName); err != nil {
 		return Material{}, err
@@ -120,7 +127,11 @@ func preflightSmokeState(tlsDir string, open func(string) (crypto.Signer, error)
 // Performs three exact operations through native CNG APIs:
 //  1. Deletes the CA certificate from LocalMachine\Root by exact SHA-256
 //     fingerprint (using RemoveTrust).
-//  2. Deletes the CNG test keys by exact name (using TestDeleteKey).
+//  2. Deletes the CNG test keys by exact name (using TestDeleteKey), each
+//     verified against the SubjectPublicKeyInfo of its certificate DER in
+//     rootDir\tls. A smoke CA DER there that is not caCertDER does not
+//     identify the CA key, and a missing DER makes that deletion not
+//     completable (ErrKeyDeletionNotCompletable).
 //  3. Removes the state directory.
 //
 // No wildcard/CN-based mutation. No certutil. No external tools.
@@ -134,16 +145,10 @@ func preflightSmokeState(tlsDir string, open func(string) (crypto.Signer, error)
 // CleanupSmoke returns nil only when the trust anchor is removed or absent,
 // both key deletions are confirmed, and the state directory is removed.
 //
-// An error return does not mean that no cleanup took place. When both key
-// deletions are confirmed, removal of rootDir is attempted even if
-// trust-anchor removal failed; if that removal succeeds, CleanupSmoke still
-// returns the trust-anchor error, with rootDir (and the CA DER it held)
-// already removed. rootDir is retained only when a key deletion is not
-// confirmed, not on every error. Callers that may need to retry trust-anchor
-// removal should therefore preserve the exact CA DER, or its SHA-256
-// fingerprint, outside rootDir before calling CleanupSmoke. The fingerprint
-// can be passed to CleanupSmokeAnchorBySHA256; it is not a substitute for the
-// caCertDER argument of CleanupSmoke.
+// An error return does not mean that no cleanup took place. rootDir, with the
+// DERs that identify the trust anchor and the keys, is removed only when the
+// trust anchor removal and both key deletions are confirmed; on any other
+// outcome it is retained.
 //
 // A retried CleanupSmoke is not guaranteed to return nil. ErrKeyNotFound is
 // ambiguous, so it keeps producing ErrKeyDeletionUnconfirmed on every retry,
@@ -162,7 +167,14 @@ func CleanupSmoke(rootDir string, caCertDER []byte) error {
 // removal by DER, exact smoke key deletion and state directory removal, with
 // the cleanupLocalTLS aggregation and retention rules.
 func cleanupSmoke(rootDir string, caCertDER []byte, trustStore TrustStore, keys MachineKeyDeleter) error {
-	return cleanupLocalTLS(rootDir, keys, func() error { return trustStore.RemoveTrust(caCertDER) })
+	named := sha256.Sum256(caCertDER)
+	return cleanupLocalTLS(cleanupRequest{
+		stateDir:    rootDir,
+		derDir:      filepath.Join(rootDir, tlsSubDir),
+		keys:        keys,
+		removeTrust: func(certRecord) error { return trustStore.RemoveTrust(caCertDER) },
+		namedCA:     &named,
+	})
 }
 
 // VerifySmokeTrust performs a read-only trust verification of the smoke CA

@@ -222,7 +222,7 @@ func TestProvisionMachineCombinedGuardsReject(t *testing.T) {
 // state and writes nothing.
 func TestProvisionMachineCombinedGuardsHealthy(t *testing.T) {
 	root := t.TempDir()
-	keys := &countingKeyStore{inner: newFakeMachineKeyStore(true, true)}
+	keys := &countingKeyStore{inner: newFakeMachineKeyStore(false, false)}
 	isPriv, _ := privileged(true, nil)
 
 	first := &orderedOpener{results: map[string]string{caKeyName: keyNotFound, serverKeyName: keyNotFound}}

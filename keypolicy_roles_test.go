@@ -7,9 +7,9 @@ import (
 )
 
 // These tests model the key role split with the machineEnv seam: the CA opener
-// behaves as windowscng.OpenWithPolicy(PolicyPrivilegedOnly) does for a
+// behaves as windowscng.Open(name, PolicyPrivilegedOnly) does for a
 // non-privileged caller (ErrPrivilegeRequired before any open) or for a CA key
-// still carrying the legacy service-signer DACL (ErrKeyPolicyMismatch). No
+// whose DACL is not exactly privileged-only (ErrKeyPolicyMismatch). No
 // machine key, file outside t.TempDir() or trust store is touched.
 
 // TestAgentRolePathsNeverOpenCAKey proves that the paths available to the
@@ -82,15 +82,15 @@ func TestCARolePathsFailClosed(t *testing.T) {
 	}
 }
 
-// TestLegacyServingCompatibleBeforeMigration proves that serving keeps working
-// on an installation whose CA key has not been migrated yet: the serving path
-// does not depend on the CA key policy at all.
-func TestLegacyServingCompatibleBeforeMigration(t *testing.T) {
+// TestServingIndependentOfCAKeyPolicy proves that serving keeps working when
+// the CA key does not open under its policy: the serving path does not depend
+// on the CA key at all.
+func TestServingIndependentOfCAKeyPolicy(t *testing.T) {
 	h := newRenewalHarness(t, harnessIssued)
 	h.caOpen.err = ErrKeyPolicyMismatch
 	m, err := loadServing(h.env())
 	if err != nil {
-		t.Fatalf("serving before migration: %v", err)
+		t.Fatalf("serving with a CA key policy mismatch: %v", err)
 	}
 	m.Close()
 	if len(h.caOpen.opened) != 0 {
